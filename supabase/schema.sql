@@ -194,3 +194,22 @@ begin
     execute format('alter publication supabase_realtime add table public.%I', t);
   end loop;
 end $$;
+
+-- Assistant: who may use it (it spends the owner's OpenAI credit), and a per-day request count.
+-- Only the assistant Edge Function (service role) reads or writes these; no client policies.
+create table public.assistant_access (
+  email text primary key check (email = lower(email)),
+  created_at timestamptz not null default now()
+);
+create table public.assistant_usage (
+  user_id uuid not null references auth.users(id) on delete cascade,
+  day date not null,
+  requests integer not null default 0,
+  input_tokens bigint not null default 0,
+  output_tokens bigint not null default 0,
+  primary key (user_id, day)
+);
+alter table public.assistant_access enable row level security;
+alter table public.assistant_usage enable row level security;
+revoke all on public.assistant_access from anon, authenticated;
+revoke all on public.assistant_usage from anon, authenticated;

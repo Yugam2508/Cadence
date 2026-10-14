@@ -1115,8 +1115,8 @@ function renderLoading(){app.innerHTML=`<header class="top"><div class="wrap"><d
 
 function render(){
  renderQueued=false;pendingRender=false;
- if(mode==='auth'){app.innerHTML=viewAuth();return}
- if(!S){renderLoading();return}
+ if(mode==='auth'){app.innerHTML=viewAuth();renderChat();return}
+ if(!S){renderLoading();renderChat();return}
  const a=document.activeElement,fid=a&&app.contains(a)?a.id:null;
  let sel=null;try{if(fid&&a.selectionStart!=null)sel=[a.selectionStart,a.selectionEnd]}catch(e){}
  applyTheme();
@@ -1128,6 +1128,7 @@ function render(){
  app.innerHTML=header()+`<main class="wrap">${v()}</main>`;
  window.scrollTo(0,y);
  if(fid){const el=document.getElementById(fid);if(el){el.focus({preventScroll:true});if(sel)try{el.setSelectionRange(sel[0],sel[1])}catch(e){}}}
+ renderChat();
 }
 /* User-driven renders wait for the pointer to lift; background renders also wait while a field is being edited. */
 function scheduleRender(background){
@@ -1289,6 +1290,330 @@ setInterval(()=>{
  if(m!==lastMin){lastMin=m;if(ui.tab==='today')scheduleRender(true)}
 },5000);
 document.addEventListener('visibilitychange',()=>{if(!document.hidden&&S)scheduleRender(true)});
+
+/* =====================================================================
+   Assistant: talk to Cadence. The model proposes tool calls; the app runs
+   them here through the same mutations as the buttons, so every change
+   syncs, earns XP and can be undone.
+   ===================================================================== */
+const chat={open:false,busy:false,api:[],items:[],snaps:new Map(),undone:false,rec:null,voice:false,loadedFor:null};
+const chatKey=()=>'cadence.chat.'+(cloud.uid||'local');
+function loadChat(){const c=LS.get(chatKey());chat.api=c&&Array.isArray(c.api)?c.api:[];chat.items=c&&Array.isArray(c.items)?c.items:[];chat.loadedFor=chatKey()}
+function saveChat(){LS.set(chatKey(),{api:chat.api.slice(-200),items:chat.items.slice(-80).map(i=>({...i,canUndo:false}))})}
+const isDate=s=>/^\d{4}-\d{2}-\d{2}$/.test(s||'')&&iso(parse(s))===s;
+const isTime=s=>/^([01]\d|2[0-3]):[0-5]\d$/.test(s||'');
+const needDate=d=>{if(!isDate(d))throw 'date must be a real date written YYYY-MM-DD';return d};
+const titleOf=(ds,id)=>{const b=blocksFor(ds).find(x=>x.id===id);return b?b.title:id};
+function dayView(ds){
+ const p=planFor(ds),d=getDay(ds),st=dayStats(ds);
+ return {date:ds,weekday:DOW[parse(ds).getDay()],plan_id:p.id,
+  blocks:blocksFor(ds).map(b=>({id:b.id,start:b.s,end:fmtEnd(b.e),title:b.title,pursuit:pursuitOf(p,b.cat).name,tracked:b.track,...(b.dropped?{dropped:b.dropped}:{}),done:!!st.done[b.id],hours:Math.round(b.h*100)/100,...(b.extra?{widget:b.extra}:{})})),
+  cards:d.cards||0,warmup:!!(d.valo||{}).aim,games:((d.valo||{}).g||[]).join(''),sleep:d.sleep||null,
+  training:S.train.items.filter(x=>x.ds===ds).map(x=>({id:x.id,type:x.type,minutes:x.min,km:x.km||null,rpe:x.rpe||null,note:x.note||''}))};
+}
+function trainingBlock(ds){return blocksFor(ds).find(b=>b.track&&b.extra==='log')}
+function blockDefaults(v,day){const b=Object.assign(blankBlock(),v&&typeof v==='object'?v:{});if(!b.id||day.some(x=>x.id===b.id))b.id=uid();return b}
+function validatePlan(p){
+ const bad=m=>m;
+ if(!p.name||typeof p.name!=='string')return bad('The plan needs a name.');
+ if(!isDate(p.start)||!isDate(p.end)||p.end<p.start)return bad('The plan needs real start and end dates, with the end on or after the start.');
+ const ids=new Set();
+ for(const x of p.pursuits||[]){if(!x||!x.id||ids.has(x.id))return bad('Every pursuit needs a unique id.');ids.add(x.id);
+  if(!Number.isInteger(+x.color)||+x.color<0||+x.color>12)return bad(`Pursuit "${x.name}" needs a colour from 0 to 12.`)}
+ for(let d=0;d<7;d++){const day=(p.template||{})[d];if(!Array.isArray(day))return bad(`template.${d} must be a list of blocks.`);const seen=new Set();
+  for(const [i,b] of day.entries()){const at=`template.${d}.${i}`;
+   if(!b||!b.id||seen.has(b.id))return bad(`${at} needs a unique id within the day.`);seen.add(b.id);
+   if(!isTime(b.s)||!(isTime(b.e)||b.e==='24:00'))return bad(`${at} needs start and end times as HH:MM.`);
+   if(!ids.has(b.cat))return bad(`${at} uses pursuit "${b.cat}", which isn't one of the plan's pursuits.`);
+   if(!['keep','min','drop'].includes(b.busy||'keep'))return bad(`${at}.busy must be keep, min or drop.`);
+   if(!['','log','games','cards','build','meals','sleep'].includes(b.extra||''))return bad(`${at}.extra is not a known widget.`);
+   if(b.h!=null&&b.h!==''&&!(+b.h>=0))return bad(`${at}.h must be a number of hours or null.`)}}
+ for(const k of ['phases','languages','breaks','rotation']){for(const [i,x] of (p[k]||[]).entries()){
+  if(!x||!x.id)return bad(`${k}.${i} needs an id.`);
+  if(!isDate(x.start)||!isDate(x.end)||x.end<x.start)return bad(`${k}.${i} needs real start and end dates.`);
+  if(k==='phases'&&!Array.isArray(x.items||[]))return bad(`phases.${i}.items must be a list.`)}}
+ if(!(+p.deloadEvery>=0))return bad('deloadEvery must be 0 or more.');
+ try{toRows({...emptyState(),plans:{plans:[p]}})}catch(e){return bad('The plan could not be saved: '+(e.message||e))}
+ return null;
+}
+const findBook=i=>{const bs=S.meta.books||[];if(i.book_id){const b=bs.find(x=>x.id===i.book_id);if(!b)throw 'No book with that id.';return b}
+ const q=String(i.title||'').toLowerCase().trim();if(!q)throw 'Give a book_id or title.';
+ const hits=bs.filter(x=>x.title.toLowerCase().includes(q));if(hits.length!==1)throw hits.length?'More than one book matches; use book_id.':'No book on the list matches that title.';return hits[0]};
+const TOOL_IMPL={
+ get_day:i=>({result:dayView(needDate(i.date))}),
+ update_day(i){
+  const ds=needDate(i.date),blocks=blocksFor(ds),byId=new Map(blocks.map(b=>[b.id,b]));
+  const unknown=[...(i.done||[]),...(i.undone||[])].filter(x=>!byId.has(x));
+  if(unknown.length)throw `Unknown block ids on ${ds}: ${unknown.join(', ')}. Call get_day to see that day's blocks.`;
+  const untracked=(i.done||[]).filter(x=>!byId.get(x).track);
+  if(untracked.length)throw `These blocks can't be ticked on ${ds} (untracked or dropped): ${untracked.map(x=>byId.get(x).title).join(', ')}.`;
+  for(const k of ['sleep_bed','sleep_wake'])if(i[k]!=null&&i[k]!==''&&!isTime(i[k]))throw `${k} must be HH:MM in 24-hour time.`;
+  for(const k of ['games','games_replace'])if(i[k]!=null&&!/^[WLD]*$/.test(i[k]))throw `${k} may only contain W, L and D.`;
+  const notes=[];
+  mutDay(ds,x=>{
+   x.c=x.c||{};(i.done||[]).forEach(id=>{x.c[id]=1});(i.undone||[]).forEach(id=>{delete x.c[id]});
+   if(i.cards!=null)x.cards=Math.max(0,Math.round(+i.cards)||0);
+   if(i.add_cards)x.cards=Math.max(0,(x.cards||0)+Math.round(+i.add_cards||0));
+   if(i.warmup!=null||i.games||i.games_replace!=null){x.valo=x.valo||{};if(i.warmup!=null)x.valo.aim=!!i.warmup;
+    if(i.games_replace!=null)x.valo.g=i.games_replace.split('');if(i.games)x.valo.g=[...(x.valo.g||[]),...i.games.split('')]}
+   if(i.sleep_bed!=null||i.sleep_wake!=null){x.sleep=x.sleep||{};if(i.sleep_bed!=null)x.sleep.bed=i.sleep_bed;if(i.sleep_wake!=null)x.sleep.wake=i.sleep_wake;if(!x.sleep.bed&&!x.sleep.wake)delete x.sleep}
+  });
+  if((i.done||[]).length)notes.push('Ticked '+i.done.map(id=>byId.get(id).title).join(', '));
+  if((i.undone||[]).length)notes.push('Unticked '+i.undone.map(id=>byId.get(id).title).join(', '));
+  if(i.cards!=null||i.add_cards)notes.push(`${getDay(ds).cards||0} new cards`);
+  if(i.games||i.games_replace!=null)notes.push('Games '+((getDay(ds).valo||{}).g||[]).join(''));
+  if(i.warmup!=null)notes.push(i.warmup?'Warm-up done':'Warm-up cleared');
+  if(i.sleep_bed!=null||i.sleep_wake!=null){const s=getDay(ds).sleep;notes.push(s?`Sleep ${s.bed||'?'}–${s.wake||'?'}`:'Sleep cleared')}
+  return {result:dayView(ds),summary:notes.length?`${notes.join(' · ')} (${fmtDate(ds)})`:null};
+ },
+ log_training(i){
+  const ds=needDate(i.date),type=TTYPES.find(t=>t.toLowerCase()===String(i.type||'').toLowerCase());
+  if(!type)throw 'type must be one of '+TTYPES.join(', ');
+  const min=Math.round(+i.minutes);if(!(min>=1&&min<=900))throw 'minutes must be between 1 and 900.';
+  const item={id:uid(),ds,type,min,km:+i.km>0?Math.round(+i.km*100)/100:0,rpe:(+i.rpe>=1&&+i.rpe<=10)?Math.round(+i.rpe):0,note:String(i.note||'').trim()};
+  const tb=trainingBlock(ds);
+  const t=clone(S.train);t.items.push(item);S.train=t;
+  if(tb){const k='m-'+ds.slice(0,7);const m=clone(S.months[k]||{});m[ds]=m[ds]||{};m[ds].c=m[ds].c||{};m[ds].c[tb.id]=1;S.months[k]=m}
+  changed();
+  return {result:{session_id:item.id,ticked_block:tb?tb.title:null},summary:`Logged ${type} ${min} min${item.km?' · '+item.km+' km':''}${item.rpe?' · RPE '+item.rpe:''} (${fmtDate(ds)})`};
+ },
+ delete_training(i){const x=S.train.items.find(t=>t.id===i.session_id);if(!x)throw 'No training session with that id.';
+  mutTrain(t=>{t.items=t.items.filter(y=>y.id!==x.id)});return {result:{ok:true},summary:`Deleted ${x.type} ${x.min} min (${fmtDate(x.ds)})`}},
+ update_week(i){
+  const wk=mondayOf(needDate(i.date)),notes=[];
+  mutMeta(m=>{
+   const setTxt=(obj,v)=>{const t=String(v).trim();if(t)obj[wk]=t;else delete obj[wk]};
+   if(i.busy!=null){if(i.busy)m.busy[wk]=1;else delete m.busy[wk];notes.push(i.busy?'Busy week on':'Busy week off')}
+   if(i.build!=null){setTxt(m.builds,i.build);notes.push('Build logged')}
+   if(i.loop_done!=null){if(i.loop_done)m.loops[wk]=1;else delete m.loops[wk];notes.push(i.loop_done?'Loop finished':'Loop unticked')}
+   if(i.meals_prepped!=null||i.recipe!=null){m.food[wk]=m.food[wk]||{};if(i.meals_prepped!=null){m.food[wk].prep=Math.max(0,Math.min(14,Math.round(+i.meals_prepped)||0));notes.push(`${m.food[wk].prep} meals prepped`)}if(i.recipe!=null){m.food[wk].recipe=String(i.recipe).trim();notes.push('Recipe saved')}}
+   if(i.vod_focus!=null){setTxt(m.vod,i.vod_focus);notes.push('VOD focus set')}
+   const rv={};if(i.review_done!=null)rv.done=i.review_done;if(i.review_slipped!=null)rv.slipped=i.review_slipped;if(i.review_change!=null)rv.change=i.review_change;
+   if(Object.keys(rv).length){m.reviews[wk]={...(m.reviews[wk]||{}),...rv};notes.push('Review saved')}
+  });
+  return {result:{week_start:wk,ok:true},summary:notes.length?`${notes.join(' · ')} (week of ${fmtShort(wk)})`:null};
+ },
+ manage_books(i){
+  const a=i.action;
+  if(a==='add'){const title=String(i.title||'').trim();if(!title)throw 'title is required to add a book.';let id=uid();
+   mutMeta(m=>{m.books.push({id,title,status:m.books.some(b=>b.status==='reading')?'queued':'reading'})});return {result:{book_id:id},summary:`Added “${title}”`}}
+  const b=findBook(i);
+  mutMeta(m=>{const x=m.books.find(y=>y.id===b.id);if(a==='start')x.status='reading';else if(a==='finish'){x.status='done';x.finished=today();if(i.line)x.line=String(i.line).trim()}
+   else if(a==='note')x.line=String(i.line||'').trim();else if(a==='remove')m.books=m.books.filter(y=>y.id!==b.id);else throw 'Unknown action.'});
+  return {result:{ok:true},summary:{start:'Started',finish:'Finished',note:'Noted',remove:'Removed'}[a]+` “${b.title}”`};
+ },
+ update_progress(i){
+  const p=planFor(today()),notes=[];
+  for(const ms of i.milestones||[]){const ph=plans().flatMap(x=>x.phases||[]).find(x=>x.id===ms.phase_id);
+   if(!ph)throw `No phase with id ${ms.phase_id}.`;if(!(ms.item_index>=0&&ms.item_index<(ph.items||[]).length))throw `Phase ${ph.name} has no item ${ms.item_index}.`}
+  const stage=(arr,name,label)=>{const k=(arr||[]).findIndex(x=>x.toLowerCase()===String(name).toLowerCase());if(k<0)throw `${label} must be one of: ${(arr||[]).join(', ')}`;return k};
+  const th=i.theory_stage!=null?stage(p.stages.theory,i.theory_stage,'theory_stage'):null,ea=i.ear_stage!=null?stage(p.stages.ear,i.ear_stage,'ear_stage'):null;
+  if((i.milestones||[]).length||i.song!=null||th!=null||ea!=null)mutMeta(m=>{
+   for(const ms of i.milestones||[]){const k=ms.phase_id+':'+ms.item_index;if(ms.done)m.ml[k]=1;else delete m.ml[k]}
+   if(i.song!=null)m.song=String(i.song).trim();if(th!=null)m.theory=th;if(ea!=null)m.ear=ea});
+  for(const ms of i.milestones||[]){const ph=plans().flatMap(x=>x.phases||[]).find(x=>x.id===ms.phase_id);notes.push(`${ms.done?'Ticked':'Unticked'} “${ph.items[ms.item_index]}”`)}
+  if(i.song!=null)notes.push(`Song: ${i.song}`);if(th!=null)notes.push(`Theory: ${p.stages.theory[th]}`);if(ea!=null)notes.push(`Ear training: ${p.stages.ear[ea]}`);
+  if(i.decision){const v=i.decision==='undecided'?null:i.decision;mutPlan(p.id,pp=>{pp.training.decision.answer=v});notes.push(`Decision: ${i.decision}`)}
+  return {result:{ok:true},summary:notes.join(' · ')||null};
+ },
+ get_plan(i){
+  const p=i.plan_id?plans().find(x=>x.id===i.plan_id):planFor(today());if(!p)throw 'No plan with that id.';
+  const map={basics:['id','name','start','end','deloadEvery','deloadCut'],pursuits:['pursuits'],template:['template'],training:['training'],phases:['phases'],languages:['languages'],breaks:['breaks'],rotation:['rotation'],resources:['resources'],modules:['modules'],stages:['stages'],rules:['rules']};
+  const secs=(i.sections&&i.sections.length?i.sections:Object.keys(map));const out={id:p.id,name:p.name};
+  for(const s of secs)for(const k of map[s]||[])out[k]=clone(p[k]);
+  if(out.template)out.template_note='Keys 0-6 are Sunday-Saturday. Use each block\'s position in its array as the index in paths.';
+  return {result:out};
+ },
+ edit_plan(i){
+  const p0=i.plan_id?plans().find(x=>x.id===i.plan_id):planFor(today());if(!p0)throw 'No plan with that id.';
+  const ops=i.operations;if(!Array.isArray(ops)||!ops.length)throw 'operations must be a non-empty list.';
+  const p=clone(p0);
+  ops.forEach((op,k)=>{
+   const path=String((op&&op.path)||'').trim(),segs=path.split('.');
+   if(!path||segs[0]==='id')throw `Operation ${k}: give a path other than id.`;
+   const parentPath=segs.slice(0,-1).join('.'),last=segs[segs.length-1];
+   if(op.op==='set'){if(!('value' in op))throw `Operation ${k}: set needs a value.`;const parent=parentPath?getPath(p,parentPath):p;
+    if(parent==null||typeof parent!=='object')throw `Operation ${k}: ${parentPath} doesn't exist.`;
+    if(Array.isArray(parent)&&!(/^\d+$/.test(last)&&+last<parent.length))throw `Operation ${k}: ${path} is past the end of the list; use insert.`;
+    parent[last]=op.value}
+   else if(op.op==='insert'){let arr=getPath(p,path);if(arr==null&&/^template\.[0-6]$/.test(path)){p.template[segs[1]]=arr=[]}
+    if(!Array.isArray(arr))throw `Operation ${k}: ${path} is not a list.`;let v=op.value;
+    if(/^template\.[0-6]$/.test(path))v=blockDefaults(v,arr);
+    else if(path==='pursuits'){v={id:uid(),name:'New pursuit',color:1,tracked:true,streak:false,deload:false,...(v||{})};if(p.pursuits.some(x=>x.id===v.id))v.id=uid()}
+    else if(['phases','languages','breaks','rotation','resources'].includes(path)){v={...(v||{})};if(!v.id||arr.some(x=>x.id===v.id))v.id=uid();if(path==='phases'){v.items=Array.isArray(v.items)?v.items:[];v.brk=!!v.brk}}
+    const at=op.index==null?arr.length:Math.max(0,Math.min(arr.length,Math.round(+op.index)));arr.splice(at,0,v)}
+   else if(op.op==='remove'){const arr=getPath(p,parentPath),idx=+last;
+    if(!Array.isArray(arr)||!Number.isInteger(idx)||idx<0||idx>=arr.length)throw `Operation ${k}: ${path} is not an item in a list.`;arr.splice(idx,1)}
+   else throw `Operation ${k}: op must be set, insert or remove.`;
+  });
+  const err=validatePlan(p);if(err)throw err+' Nothing was changed.';
+  mutPlans(ps=>{const ix=ps.plans.findIndex(x=>x.id===p.id);ps.plans[ix]=p});
+  return {result:{ok:true,plan_id:p.id},summary:String(i.summary||'Edited the plan')};
+ },
+ create_plan(i){
+  const start=needDate(i.start),end=needDate(i.end);if(end<start)throw 'end must be on or after start.';
+  const src=i.from_plan_id?plans().find(x=>x.id===i.from_plan_id):planFor(today());if(i.mode==='copy'&&!src)throw 'No plan to copy.';
+  const np=i.mode==='copy'?{...clone(src),id:uid(),name:String(i.name||src.name+' (next)'),start,end,phases:[],languages:[],breaks:[],rotation:[]}:Object.assign(blankPlan(start),{name:String(i.name||'New plan'),end});
+  if(np.training&&np.training.decision)np.training.decision={...np.training.decision,date:'',altUntil:'',answer:null};
+  const err=validatePlan(np);if(err)throw err;
+  const overlap=plans().filter(x=>x.start<=end&&x.end>=start).map(x=>x.name);
+  mutPlans(ps=>{ps.plans.push(np)});
+  return {result:{plan_id:np.id,overlaps:overlap},summary:`Created plan “${np.name}”, ${fmtShort(start)} – ${fmtShort(end)}`};
+ },
+ get_history(i){
+  const from=needDate(i.from),to=needDate(i.to);if(to<from)throw 'to must be on or after from.';if(daysBetween(from,to)>62)throw 'Ask for at most 62 days.';
+  const days=[];for(let ds=from;ds<=to;ds=addDays(ds,1)){const st=dayStats(ds),d=getDay(ds),sl=sleepHours(d);
+   days.push({date:ds,weekday:DOW[parse(ds).getDay()],done:st.n,tracked:st.total,hours_done:Math.round(st.dh*10)/10,hours_planned:Math.round(st.ph*10)/10,
+    missed:st.blocks.filter(b=>!st.done[b.id]).map(b=>b.title),cards:d.cards||0,games:((d.valo||{}).g||[]).join(''),sleep_hours:sl==null?null:Math.round(sl*10)/10,
+    training:S.train.items.filter(x=>x.ds===ds).map(x=>`${x.type} ${x.min} min`)})}
+  return {result:{days}};
+ },
+ get_progress(){
+  const g=game(),p=planFor(today()),wk=mondayOf(today()),ws=weekStats(wk);
+  return {result:{level:g.level,rank:g.rank,xp:g.xp,xp_to_next_level:g.need-g.into,xp_today:g.todayXP,xp_this_week:g.weekXP,streak:g.streak,best_streak:g.best,
+   week:{hours_done:Math.round(ws.dh*10)/10,hours_planned:Math.round(ws.ph*10)/10,by_pursuit:Object.fromEntries(Object.entries(ws.per).map(([k,v])=>[pursuitOf(p,k).name,{done:Math.round(v.d*10)/10,planned:Math.round(v.p*10)/10}]))},
+   skills:p.pursuits.filter(x=>x.tracked).map(x=>({pursuit:x.name,level:skillOf(g.pxp[x.id]||0),hours:Math.round((g.phours[x.id]||0)*10)/10,streak:g.pcur[x.id]||0})),
+   quests:weeklyQuests(wk).map(q=>({quest:q.t,progress:Math.round(q.cur*10)/10,target:Math.round(q.max*10)/10})),
+   badges_unlocked:BADGES.filter(b=>g.badges.includes(b.id)).map(b=>b.name),
+   next_badges:BADGES.filter(b=>!g.badges.includes(b.id)).map(b=>{const [a,n]=b.prog(g);return {name:b.name,desc:b.desc,progress:a,target:n}}).sort((x,y)=>y.progress/y.target-x.progress/x.target).slice(0,4),
+   slipping_three_weeks:slipping().map(x=>x.name)}};
+ },
+};
+function runTool(name,input){
+ const f=TOOL_IMPL[name];if(!f)return {ok:false,result:{error:`Unknown tool ${name}.`}};
+ try{const r=f(input||{});return {ok:true,result:r.result,summary:r.summary||null}}
+ catch(e){return {ok:false,result:{error:typeof e==='string'?e:(e&&e.message)||String(e)}}}
+}
+function contextText(){
+ const t=today(),now=new Date(),p=planFor(t),c=ctx(t,p),g=game(),st=dayStats(t),ws=weekStats(mondayOf(t)),d=getDay(t),ys=dayStats(addDays(t,-1));
+ const dec=(p.training||{}).decision||{};
+ const blocks=blocksFor(t).map(b=>`${b.id} · ${b.s}–${fmtEnd(b.e)} · ${b.title} · ${b.track?`${st.done[b.id]?'done':'not done'} (${fmtH(b.h)})`:(b.dropped?'dropped':'untracked')}`).join('\n');
+ let tz='';try{tz=Intl.DateTimeFormat().resolvedOptions().timeZone}catch(e){}
+ return ['Live app state.',
+  `Now: ${DOW[now.getDay()]} ${t} ${pad(now.getHours())}:${pad(now.getMinutes())}${tz?' ('+tz+')':''}.`,
+  `Plan covering today: "${p.name}" (id ${p.id}), ${p.start} to ${p.end}${c.pre?', not started yet':c.after?', ended':`, week ${c.wi+1}`}. Phase: ${phaseLabel(p,t)||'none'}. Language: ${c.lang}. Rotating block: ${c.rot?c.rot.name:'none'}. Busy week: ${c.busy?'yes':'no'}. Deload week: ${c.deload?'yes':'no'}.${c.brk?` On break: ${c.brk.name}.`:''}`,
+  dec.question?`Decision "${dec.question}", due ${dec.date}: ${dec.answer||'undecided'}.`:'',
+  `Today's blocks (id · time · title · status):\n${blocks||'none'}`,
+  `Today's logs: cards ${d.cards||0}; warm-up ${(d.valo||{}).aim?'done':'no'}; games ${((d.valo||{}).g||[]).join('')||'none'}; sleep ${d.sleep&&(d.sleep.bed||d.sleep.wake)?`bed ${d.sleep.bed||'?'}, woke ${d.sleep.wake||'?'}`:'not logged'}; training ${S.train.items.filter(x=>x.ds===t).map(x=>`${x.type} ${x.min} min (id ${x.id})`).join(', ')||'none'}.`,
+  `Yesterday: ${ys.n} of ${ys.total} blocks done.`,
+  `Progress: level ${g.level} ${g.rank}, ${g.xp} XP (${g.todayXP} today), streak ${g.streak} days. This week: ${fmtH(ws.dh)} of ${fmtH(ws.ph)} planned.`,
+  `Reading now: ${(S.meta.books||[]).filter(b=>b.status==='reading').map(b=>`"${b.title}" (id ${b.id})`).join(', ')||'nothing'}.`,
+  plans().length>1?`Other plans: ${plans().filter(x=>x.id!==p.id).map(x=>`"${x.name}" (id ${x.id}, ${x.start} to ${x.end})`).join('; ')}.`:'',
+  chat.undone?'The user pressed Undo on your previous changes, so those changes are no longer in the app.':'',
+ ].filter(Boolean).join('\n');
+}
+async function callAssistant(messages){
+ const {data,error}=await sb.functions.invoke('assistant',{body:{messages}});
+ if(error){let msg='';try{const j=await error.context.json();msg=j.message||''}catch(_){}
+  if(!msg)msg=navigator.onLine===false?'You’re offline. The assistant needs a connection.':'The assistant could not be reached. Try again in a moment.';throw new Error(msg)}
+ return data;
+}
+function windowed(){let i=Math.max(0,chat.api.length-60);while(i<chat.api.length&&chat.api[i].role!=='user')i++;return chat.api.slice(i)}
+async function ask(text){
+ text=String(text||'').trim();if(!text||chat.busy)return;
+ if(mode!=='cloud'||!sb){chat.items.push({id:uid(),role:'error',text:'Sign in to use the assistant. It runs on your account so it can change your data.'});renderChat();return}
+ chat.busy=true;
+ const snap=clone(S),itemId=uid(),start=chat.api.length;
+ chat.items.push({id:uid(),role:'user',text});
+ const reply={id:itemId,role:'assistant',text:'',actions:[]};chat.items.push(reply);
+ chat.api.push({role:'user',content:text},{role:'system',content:contextText()});chat.undone=false;
+ renderChat();
+ try{
+  for(let step=0;step<10;step++){
+   const res=await callAssistant(windowed());
+   const m=res.message||{role:'assistant',content:''};chat.api.push(m);
+   if(m.content)reply.text+=(reply.text?'\n\n':'')+m.content;
+   const calls=m.tool_calls||[];
+   if(!calls.length)break;
+   for(const tc of calls){
+    let input={};try{input=JSON.parse(tc.function.arguments||'{}')}catch(_){chat.api.push({role:'tool',tool_call_id:tc.id,content:JSON.stringify({error:'Arguments were not valid JSON.'})});continue}
+    const r=runTool(tc.function.name,input);
+    if(r.summary)reply.actions.push(r.summary);
+    chat.api.push({role:'tool',tool_call_id:tc.id,content:JSON.stringify(r.ok?r.result:{error:r.result.error})});
+   }
+   renderChat();
+   if(step===9)reply.text+=(reply.text?'\n\n':'')+'That took more steps than expected, so I stopped here.';
+  }
+  if(!reply.text&&!reply.actions.length)reply.text='Done.';
+ }catch(e){
+  if(chat.api.length&&chat.api[chat.api.length-1].role==='system'){chat.api.length=start}
+  reply.role='error';reply.text=e.message||String(e);
+ }
+ if(reply.actions.length){chat.snaps.set(itemId,snap);reply.canUndo=true}
+ chat.busy=false;saveChat();renderChat();
+}
+function undoReply(id){
+ const snap=chat.snaps.get(id);if(!snap)return;
+ S=clone(snap);normalize();chat.snaps.delete(id);chat.undone=true;
+ const it=chat.items.find(x=>x.id===id);if(it){it.canUndo=false;it.undone=true}
+ lastGame=null;changed();saveChat();renderChat();toast('<span>Changes undone</span>');
+}
+function newChat(){chat.api=[];chat.items=[];chat.snaps.clear();chat.undone=false;saveChat();renderChat()}
+
+/* Chat UI: lives outside #app so app re-renders never touch it. */
+const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
+const chatRoot=document.getElementById('chat');
+const ICON_CHAT='<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a8 8 0 0 1-11.6 7.1L4 20l1-4.6A8 8 0 1 1 21 12z"/></svg>';
+const ICON_MIC='<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>';
+const ICON_SEND='<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg>';
+const SUGGEST=['I did my swim, 45 min, felt easy','Bed at 00:40, up at 08:10','Finished ML and guitar today','Add 15 min stretching after the morning session on weekdays','How’s my week going?'];
+function fmtMsg(t){return esc(t).replace(/\*\*(.+?)\*\*/g,'<b>$1</b>').split('\n').map(l=>/^\s*[-•]\s+/.test(l)?'<span class="bl">'+l.replace(/^\s*[-•]\s+/,'')+'</span>':l).join('<br>')}
+function chatLogHTML(){
+ if(!chat.items.length)return `<div class="chatempty"><p><b>Tell Cadence what you did, or what to change.</b></p><p class="small muted">It ticks blocks, logs sessions, sleep, games and cards, edits your plan, and answers questions about your progress. Every change can be undone.</p>
+  <div class="sugs">${SUGGEST.map(s=>`<button class="sug" data-ca="suggest" data-v="${esc(s)}">${esc(s)}</button>`).join('')}</div></div>`;
+ return chat.items.map(it=>{
+  if(it.role==='user')return `<div class="msg me">${esc(it.text)}</div>`;
+  if(it.role==='error')return `<div class="msg err">${esc(it.text)}</div>`;
+  const acts=(it.actions||[]).map(a=>`<span class="act">${esc(a)}</span>`).join('');
+  const pending=chat.busy&&it===chat.items[chat.items.length-1];
+  return `<div class="msg ai">${acts?`<div class="acts">${acts}</div>`:''}${it.text?`<div>${fmtMsg(it.text)}</div>`:''}${pending?'<div class="typing" aria-label="Working"><i></i><i></i><i></i></div>':''}
+   ${it.canUndo&&chat.snaps.has(it.id)?`<button class="btn ghost small" data-ca="undo" data-v="${it.id}">Undo</button>`:''}${it.undone?'<span class="small muted">Undone</span>':''}</div>`;
+ }).join('');
+}
+function renderChat(){
+ if(!chatRoot)return;
+ const show=!!S&&mode!=='auth'&&mode!=='boot';
+ if(show&&chat.loadedFor!==chatKey())loadChat();
+ if(!chatRoot.dataset.built){
+  chatRoot.dataset.built='1';
+  chatRoot.innerHTML=`<button class="fab" data-ca="open" aria-label="Open assistant">${ICON_CHAT}<span>Ask</span></button>
+   <section class="chatpanel" role="dialog" aria-label="Assistant" hidden>
+    <header class="chathead"><b>Assistant</b><span class="spacer"></span><button class="btn ghost small" data-ca="new">New chat</button><button class="iconbtn" data-ca="close" aria-label="Close assistant">✕</button></header>
+    <div class="chatlog" id="chatlog" aria-live="polite"></div>
+    <form class="chatin" id="chatform"><textarea id="chatbox" rows="1" placeholder="What did you do? What should change?" aria-label="Message"></textarea>
+     ${SR?`<button type="button" class="iconbtn mic" data-ca="mic" aria-label="Speak">${ICON_MIC}</button>`:''}<button type="submit" class="iconbtn send" aria-label="Send">${ICON_SEND}</button></form>
+   </section>`;
+ }
+ const fab=chatRoot.querySelector('.fab'),panel=chatRoot.querySelector('.chatpanel');
+ fab.hidden=!show||chat.open;panel.hidden=!show||!chat.open;
+ if(!show||!chat.open)return;
+ const log=document.getElementById('chatlog');log.innerHTML=chatLogHTML();log.scrollTop=log.scrollHeight;
+ const send=chatRoot.querySelector('.send');if(send)send.disabled=chat.busy;
+ const mic=chatRoot.querySelector('.mic');if(mic){mic.classList.toggle('on',!!chat.rec);mic.setAttribute('aria-label',chat.rec?'Stop listening':'Speak')}
+}
+function openChat(){chat.open=true;renderChat();setTimeout(()=>{const b=document.getElementById('chatbox');if(b)b.focus()},30)}
+function sendBox(){const b=document.getElementById('chatbox');if(!b)return;const v=b.value;b.value='';sizeBox();ask(v)}
+function sizeBox(){const b=document.getElementById('chatbox');if(!b)return;b.style.height='auto';b.style.height=Math.min(140,b.scrollHeight)+'px'}
+function toggleMic(){
+ if(!SR)return;if(chat.rec){chat.rec.stop();return}
+ const box=document.getElementById('chatbox'),base=box.value?box.value.trim()+' ':'';let finalText='';
+ const r=new SR();r.lang=navigator.language||'en-US';r.interimResults=true;r.continuous=false;
+ r.onresult=e=>{let txt='';finalText='';for(const res of e.results){txt+=res[0].transcript;if(res.isFinal)finalText+=res[0].transcript}box.value=base+txt;sizeBox()};
+ r.onerror=e=>{if(e.error==='not-allowed'||e.error==='service-not-allowed')toast('<span>Microphone access is blocked for this site.</span>')};
+ r.onend=()=>{chat.rec=null;renderChat();if(finalText.trim())sendBox()};
+ try{r.start();chat.rec=r;renderChat()}catch(e){chat.rec=null}
+}
+if(chatRoot){
+ chatRoot.addEventListener('click',e=>{const el=e.target.closest('[data-ca]');if(!el)return;const a=el.dataset.ca;
+  if(a==='open')openChat();else if(a==='close'){chat.open=false;if(chat.rec)chat.rec.stop();renderChat()}
+  else if(a==='new')newChat();else if(a==='undo')undoReply(el.dataset.v);else if(a==='mic')toggleMic();
+  else if(a==='suggest'){const b=document.getElementById('chatbox');b.value=el.dataset.v;sizeBox();b.focus()}});
+ chatRoot.addEventListener('submit',e=>{e.preventDefault();sendBox()});
+ chatRoot.addEventListener('input',e=>{if(e.target.id==='chatbox')sizeBox()});
+ chatRoot.addEventListener('keydown',e=>{if(e.target.id==='chatbox'&&e.key==='Enter'&&!e.shiftKey&&!e.isComposing){e.preventDefault();sendBox()}
+  if(e.key==='Escape'){chat.open=false;renderChat()}});
+}
+addEventListener('keydown',e=>{if((e.metaKey||e.ctrlKey)&&e.key.toLowerCase()==='k'&&S&&mode!=='auth'){e.preventDefault();chat.open?(chat.open=false,renderChat()):openChat()}});
 
 window.__cadence={toRows:st=>toRows(st),fromRows:R=>fromRows(R),defaultPlan,get S(){return S},stable};
 boot();

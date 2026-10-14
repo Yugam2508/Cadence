@@ -20,11 +20,16 @@ editable in the **Plan** tab, and you can start new plans for later seasons whil
 - **Review**: the Sunday questions, rules for a bad week, and a warning when a pursuit slips three weeks running.
 - **Plan**: edit pursuits, the timetable for each weekday, training sessions, phases, languages,
   rotating blocks, breaks, programs and rules. Multiple plans, each covering its own dates.
+- **Assistant**: tap **Ask** (or Ctrl/Cmd+K) and type or speak: "did my run, 40 min easy",
+  "bed at 1, up at 8:30", "move Valorant to 21:00 on Mondays", "how's my week going?". It ticks blocks,
+  logs sessions, sleep, games and cards, edits the plan and answers questions. Every reply that changed
+  something has an **Undo** button.
 
 ## Stack
 
 - Plain HTML, CSS and JavaScript. No build step.
-- [Supabase](https://supabase.com) Postgres for storage, auth (email and password) and realtime sync.
+- [Supabase](https://supabase.com) Postgres for storage, auth (email and password), realtime sync, and an
+  Edge Function for the assistant (OpenAI API).
   Every table uses row-level security so each account only ever sees its own rows.
 - A service worker caches the app so it opens offline; changes made offline sync when you reconnect.
 - Installable as an app (PWA) on iOS, Android and desktop.
@@ -40,6 +45,7 @@ editable in the **Plan** tab, and you can start new plans for later seasons whil
 | `sw.js`, `manifest.webmanifest`, `icon*` | Offline support and install metadata |
 | `vendor/supabase-2.45.4.js` | Supabase JS client (MIT), vendored so the app works offline |
 | `supabase/schema.sql` | Database schema, policies and realtime setup |
+| `supabase/functions/assistant/index.ts` | Edge Function that calls the OpenAI API for the assistant |
 
 ## Running locally
 
@@ -61,6 +67,19 @@ import the repo with no framework preset and no build command.
 3. In **Authentication → URL Configuration**, set the **Site URL** to the deployed address and add it to
    the redirect allow list, so confirmation and password-reset emails link back to the app.
 
+## Assistant setup
+
+The assistant runs through the `assistant` Supabase Edge Function, which keeps the OpenAI key on the
+server. The model chooses tool calls; the app runs them locally through the same code as the buttons,
+so every change syncs, earns XP and can be undone.
+
+1. Deploy `supabase/functions/assistant` (JWT verification on).
+2. In **Edge Functions → Secrets**, add `OPENAI_API_KEY`. Optional: `OPENAI_MODEL` (default
+   `gpt-5.4-mini`), `OPENAI_REASONING_EFFORT` (default `low`) and `ASSISTANT_DAILY_LIMIT`
+   (default 400 requests a day).
+3. Allow your account: `insert into public.assistant_access (email) values ('you@example.com');`
+   Only listed accounts can use it, since it spends your OpenAI credit.
+
 ## Data model
 
 | Table | Holds |
@@ -77,3 +96,5 @@ import the repo with no framework preset and no build command.
 | `milestone_checks` | Ticked milestone items |
 | `books` | Reading list |
 | `prefs` | Current song, theory and ear-training stages, theme |
+| `assistant_access` | Accounts allowed to use the assistant |
+| `assistant_usage` | Assistant requests and tokens per user per day |

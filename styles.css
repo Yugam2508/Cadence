@@ -234,3 +234,32 @@ canvas.confetti{position:fixed;inset:0;width:100%;height:100%;pointer-events:non
 .auth form{display:flex;flex-direction:column;gap:10px}
 .msg{font-size:.88rem;border-radius:8px;padding:8px 12px;background:var(--sunk)}
 .msg.bad{color:var(--bad)}
+
+/* Assistant */
+.fab{position:fixed;z-index:15;right:calc(16px + env(safe-area-inset-right,0px));bottom:calc(16px + env(safe-area-inset-bottom,0px));display:inline-flex;align-items:center;gap:8px;
+  background:var(--accent);color:var(--accent-ink);border:0;border-radius:999px;padding:12px 18px;font-weight:600;cursor:pointer;box-shadow:0 8px 24px rgba(0,0,0,.2)}
+.chatpanel{position:fixed;z-index:16;top:0;right:0;bottom:0;width:min(440px,100%);background:var(--surface);border-left:1px solid var(--line);display:flex;flex-direction:column;
+  box-shadow:-12px 0 32px rgba(0,0,0,.12);padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px);padding-right:env(safe-area-inset-right,0px)}
+.chathead{display:flex;align-items:center;gap:8px;padding:12px 16px;border-bottom:1px solid var(--line)}
+.chathead b{font-family:var(--f-display);font-size:1.1rem}
+.chatlog{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:10px;overscroll-behavior:contain}
+.msg{max-width:88%;border-radius:14px;padding:9px 13px;font-size:.93rem;line-height:1.45;display:flex;flex-direction:column;gap:6px;overflow-wrap:anywhere}
+.msg.me{align-self:flex-end;background:var(--accent);color:var(--accent-ink);border-bottom-right-radius:4px;white-space:pre-wrap}
+.msg.ai{align-self:flex-start;background:var(--sunk);border-bottom-left-radius:4px}
+.msg.err{align-self:flex-start;background:color-mix(in srgb,var(--bad) 12%,transparent);color:var(--bad)}
+.msg .btn{align-self:flex-start}
+.msg .bl{display:block;padding-left:14px;position:relative}.msg .bl::before{content:"";position:absolute;left:3px;top:.6em;width:5px;height:5px;border-radius:50%;background:currentColor}
+.acts{display:flex;flex-wrap:wrap;gap:4px}
+.act{font-size:.78rem;background:var(--surface);border:1px solid var(--line);border-radius:999px;padding:2px 9px;color:var(--ink)}
+.typing{display:inline-flex;gap:4px;padding:4px 0}.typing i{width:6px;height:6px;border-radius:50%;background:var(--muted);opacity:.5}
+@media (prefers-reduced-motion:no-preference){.typing i{animation:blink 1s infinite}.typing i:nth-child(2){animation-delay:.15s}.typing i:nth-child(3){animation-delay:.3s}}
+@keyframes blink{50%{opacity:1}}
+.chatempty{display:flex;flex-direction:column;gap:10px;margin:auto 0}
+.sugs{display:flex;flex-wrap:wrap;gap:6px}
+.sug{border:1px solid var(--line);background:var(--surface);border-radius:999px;padding:6px 12px;font-size:.85rem;cursor:pointer;text-align:left}
+.chatin{display:flex;gap:8px;align-items:flex-end;padding:12px 16px;border-top:1px solid var(--line)}
+.chatin textarea{flex:1;min-height:40px;max-height:140px;resize:none;border-radius:12px;padding:9px 12px;line-height:1.4}
+.chatin .iconbtn{width:40px;height:40px;border-radius:12px}
+.chatin .send{background:var(--accent);color:var(--accent-ink);border-color:var(--accent)}
+.chatin .mic.on{background:var(--bad);color:#fff;border-color:var(--bad)}
+@media (max-width:560px){.chatpanel{border-left:0}.toasts{padding-bottom:calc(76px + env(safe-area-inset-bottom,0px))}}
