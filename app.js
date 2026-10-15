@@ -1361,6 +1361,8 @@ function dayView(ds){
   cards:d.cards||0,warmup:!!(d.valo||{}).aim,games:((d.valo||{}).g||[]).join(''),sleep:d.sleep||null,
   training:S.train.items.filter(x=>x.ds===ds).map(x=>({id:x.id,type:x.type,minutes:x.min,km:x.km||null,rpe:x.rpe||null,note:x.note||''}))};
 }
+function sessionKind(title){const t=String(title||'').toLowerCase();
+ if(/swim/.test(t))return 'Swim';if(/ride|bike|cycl/.test(t))return /run/.test(t)?'Brick':'Bike';if(/run/.test(t))return 'Run';if(/strength|gym|weights/.test(t))return 'Strength';return null}
 function trainingBlock(ds){return blocksFor(ds).find(b=>b.track&&b.extra==='log')}
 function blockDefaults(v,day){const b=Object.assign(blankBlock(),v&&typeof v==='object'?v:{});if(!b.id||day.some(x=>x.id===b.id))b.id=uid();return b}
 function validatePlan(p){
@@ -1422,11 +1424,24 @@ const TOOL_IMPL={
   if(!type)throw 'type must be one of '+TTYPES.join(', ');
   const min=Math.round(+i.minutes);if(!(min>=1&&min<=900))throw 'minutes must be between 1 and 900.';
   const item={id:uid(),ds,type,min,km:+i.km>0?Math.round(+i.km*100)/100:0,rpe:(+i.rpe>=1&&+i.rpe<=10)?Math.round(+i.rpe):0,note:String(i.note||'').trim()};
-  const tb=trainingBlock(ds);
+  // Only tick the planned training block when this session is that session: the same kind, and most of
+  // its length unless the user said it was the planned one. Anything else is saved as extra activity.
+  const tb=trainingBlock(ds),done=tb&&(getDay(ds).c||{})[tb.id];
+  let tick=false,why=null,planned=null;
+  if(tb){
+   const kind=sessionKind(tb.title),pm=Math.round(tb.h*60);planned={title:tb.title,minutes:pm,kind:kind||'unknown'};
+   const sameKind=!kind||kind===type||(kind==='Brick'&&type==='Bike');
+   if(done)why='The planned session was already ticked.';
+   else if(i.completes_planned===false)why='Saved as extra activity, as requested.';
+   else if(!sameKind)why=`This is a ${type.toLowerCase()}, and the planned session is ${tb.title} (${kind.toLowerCase()}), so it was saved as extra activity and the planned session is still open.`;
+   else if(i.completes_planned!==true&&min<.7*pm)why=`${min} min is well short of the planned ${pm} min, so the planned session is still open. If the user says this was their planned session, tick it with update_day.`;
+   else tick=true;
+  }
   const t=clone(S.train);t.items.push(item);S.train=t;
-  if(tb){const k='m-'+ds.slice(0,7);const m=clone(S.months[k]||{});m[ds]=m[ds]||{};m[ds].c=m[ds].c||{};m[ds].c[tb.id]=1;S.months[k]=m}
+  if(tick){const k='m-'+ds.slice(0,7);const m=clone(S.months[k]||{});m[ds]=m[ds]||{};m[ds].c=m[ds].c||{};m[ds].c[tb.id]=1;S.months[k]=m}
   changed();
-  return {result:{session_id:item.id,ticked_block:tb?tb.title:null},summary:`Logged ${type} ${min} min${item.km?' · '+item.km+' km':''}${item.rpe?' · RPE '+item.rpe:''} (${fmtDate(ds)})`};
+  return {result:{session_id:item.id,ticked_planned_block:tick,planned_session:planned,...(why?{note:why}:{})},
+   summary:`Logged ${type} ${min} min${item.km?' · '+item.km+' km':''}${item.rpe?' · RPE '+item.rpe:''} (${fmtDate(ds)})${tick?' · ticked '+tb.title:tb&&!done?' · '+tb.title+' still open':''}`};
  },
  delete_training(i){const x=S.train.items.find(t=>t.id===i.session_id);if(!x)throw 'No training session with that id.';
   mutTrain(t=>{t.items=t.items.filter(y=>y.id!==x.id)});return {result:{ok:true},summary:`Deleted ${x.type} ${x.min} min (${fmtDate(x.ds)})`}},

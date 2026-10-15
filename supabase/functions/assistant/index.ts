@@ -24,8 +24,9 @@ How the app is organised:
 
 How to act:
 - Logging is low-stakes and the user can undo any of your changes with one tap, so act directly instead of asking for confirmation. Resolve relative dates ("yesterday", "on Sunday", "last night") from the date in the state message. Ask one short question only when something is genuinely ambiguous, such as which of two blocks they mean.
-- When the user says they did something, tick the matching block and log the details the app can hold. log_training also ticks that day's training block.
-- Log only what the user told you happened. Don't fill in numbers they didn't give.
+- When the user says they did something, tick the matching block and log the details the app can hold. A planned block counts as done only if what they did is that block; a 10-minute commute ride is not a 35-minute run. Log extra activity with log_training (completes_planned false) and say the planned session is still open.
+- Log only what the user told you happened. Don't invent numbers. If a required number is missing (such as minutes for a workout), ask, unless the user's words make a rough figure obvious (a short commute ride); then say in your reply that it's an estimate and put "time estimated" in the note.
+- If the user says something was logged or ticked wrongly, fix it straight away with tools (untick, delete, log again) and say what you changed. Never just explain, and never offer a fix without doing it.
 - For plan changes, call get_plan for the sections you need, then edit_plan with precise operations, changing only what was asked. A timetable change applies to every week the plan covers. If the user seems to want a change for just one day or week, say so and ask before changing the plan; a busy week is the built-in way to lighten a single week.
 - To restart counting from a date, call set_tracking_start. If the user also wants the plan itself to begin then, move the plan's start and, if they should begin then too, its first phase, language and rotating block with one edit_plan call. Earlier days stay saved but stop counting; delete their logs with clear_logs only if the user asks for that.
 - Delete logged data with clear_logs only when the user asks for that.
@@ -63,7 +64,7 @@ const TOOL_DEFS = [
   },
   {
     name: "log_training",
-    description: "Log a training session. Also ticks that date's training block if it has one.",
+    description: "Log a training session or any other exercise (a commute ride counts). The app ticks that date's planned training block only when this is that session: the same kind and most of its length, or completes_planned true. Otherwise the session is saved as extra activity and the result says the planned session is still open.",
     input_schema: {
       type: "object",
       properties: {
@@ -73,6 +74,7 @@ const TOOL_DEFS = [
         km: { type: "number", minimum: 0 },
         rpe: { type: "integer", minimum: 1, maximum: 10, description: "Perceived effort, 1 to 10." },
         note: { type: "string" },
+        completes_planned: { type: "boolean", description: "true only when the user says this was their planned session for the day (even if shortened); false for extra activity such as a commute. Omit when unclear." },
       },
       required: ["date", "type", "minutes"],
     },
