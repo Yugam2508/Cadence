@@ -157,7 +157,7 @@ function blankPlan(from){
 /* =====================================================================
    State. S is the in-memory model; the database tables mirror it.
    ===================================================================== */
-const DEFAULT_META={busy:{},ml:{},builds:{},theory:0,ear:0,song:'',loops:{},books:[],vod:{},food:{},reviews:{},theme:'system'};
+const DEFAULT_META={busy:{},ml:{},builds:{},theory:0,ear:0,song:'',loops:{},books:[],vod:{},food:{},reviews:{},theme:'system',trackFrom:''};
 let S=null;              // {meta, train:{items}, months:{'m-YYYY-MM':{date:{c,cards,valo,sleep}}}, plans:{plans:[]}}
 let ver=0;               // bumps on every change, used to memoise derived numbers
 const ui={tab:LS.get('cadence.tab')||'today',sel:today(),prog:LS.get('cadence.prog')||'',logOpen:null,confirm:null,importText:'',note:'',editPlan:null,psec:'basics',pday:1,
@@ -177,6 +177,8 @@ function normalize(){
   S.plans.plans.push(p);
  }
  delete S.meta.rotation;delete S.meta.decision;delete S.meta.dad;
+ // Progress counts from an explicit date; a new account starts counting today (or when its plan starts, if later).
+ if(!/^\d{4}-\d{2}-\d{2}$/.test(S.meta.trackFrom||'')){const f=S.plans.plans.reduce((a,p)=>p.start&&(!a||p.start<a)?p.start:a,''),t=today();S.meta.trackFrom=f&&f>t?f:t}
  for(const p of S.plans.plans){for(let d=0;d<7;d++)if(!Array.isArray((p.template||(p.template={}))[d]))p.template[d]=[];
   ['phases','languages','breaks','rotation','resources','pursuits','rules'].forEach(k=>{if(!Array.isArray(p[k]))p[k]=[]});
   p.training=p.training||{};p.training.decision=p.training.decision||{};p.training.base=p.training.base||{};p.training.alt=p.training.alt||{};
@@ -224,7 +226,7 @@ function toRows(st){
  }
  for(const k in m.ml)if(m.ml[k]){const i=k.lastIndexOf(':');R.milestone_checks[k]={id:k,phase_key:k.slice(0,i),item_index:+k.slice(i+1)}}
  (m.books||[]).forEach((b,i)=>{R.books[b.id]={id:b.id,title:b.title||'Untitled',status:['queued','reading','done'].includes(b.status)?b.status:'queued',finished_on:dateOrNull(b.finished),line:b.line||'',sort:i}});
- R.prefs.me={id:'me',song:m.song||'',theory_stage:+m.theory||0,ear_stage:+m.ear||0,theme:m.theme||'system'};
+ R.prefs.me={id:'me',song:m.song||'',theory_stage:+m.theory||0,ear_stage:+m.ear||0,theme:m.theme||'system',track_from:dateOrNull(m.trackFrom)};
  return R;
 }
 function fromRows(R){
@@ -253,7 +255,7 @@ function fromRows(R){
   if(r.review_done||r.review_slipped||r.review_change)m.reviews[w]={done:r.review_done,slipped:r.review_slipped,change:r.review_change};}
  for(const r of Object.values(R.milestone_checks))m.ml[r.id]=1;
  m.books=Object.values(R.books).sort(bySort).map(r=>{const b={id:r.id,title:r.title,status:r.status};if(r.finished_on)b.finished=r.finished_on;if(r.line)b.line=r.line;return b});
- const pr=R.prefs.me;if(pr){m.song=pr.song;m.theory=pr.theory_stage;m.ear=pr.ear_stage;m.theme=pr.theme}
+ const pr=R.prefs.me;if(pr){m.song=pr.song;m.theory=pr.theory_stage;m.ear=pr.ear_stage;m.theme=pr.theme;m.trackFrom=pr.track_from||''}
  return st;
 }
 const emptyRows=()=>{const R={};TABLES.forEach(t=>R[t]={});return R};
@@ -326,13 +328,28 @@ async function fetchAll(){
  }
  return R;
 }
+/* Three-way merge of one row: take the server's value for every field this device hasn't changed,
+   keep this device's value where only it changed, and recurse into objects (plan settings). */
+function merge3(base,local,remote){
+ if(!base||!local||!remote||typeof base!=='object'||typeof local!=='object'||typeof remote!=='object'||Array.isArray(local)||Array.isArray(remote))return local;
+ const out={};
+ for(const k of new Set([...Object.keys(base),...Object.keys(local),...Object.keys(remote)])){
+  const b=base[k],l=local[k],r=remote[k];
+  const v=stable(l)===stable(b)?r:stable(r)===stable(b)?l:merge3(b,l,r);
+  if(v!==undefined)out[k]=v;
+ }
+ return out;
+}
 /* Merge: the server wins except where this device has changes it has not pushed yet. */
 function mergeRemote(remote){
  const cur=S?toRows(S):emptyRows(),base=cloud.base||emptyRows(),merged=emptyRows();
  for(const t of TABLES){
   Object.assign(merged[t],remote[t]);
   const ids=new Set([...Object.keys(cur[t]),...Object.keys(base[t])]);
-  for(const id of ids)if(stable(cur[t][id])!==stable(base[t][id])){if(id in cur[t])merged[t][id]=cur[t][id];else delete merged[t][id]}
+  for(const id of ids)if(stable(cur[t][id])!==stable(base[t][id])){
+   if(!(id in cur[t]))delete merged[t][id];
+   else merged[t][id]=(id in remote[t]&&id in base[t])?merge3(base[t][id],cur[t][id],remote[t][id]):cur[t][id];
+  }
  }
  return merged;
 }
@@ -340,7 +357,10 @@ async function refresh(){
  if(mode!=='cloud'||!sb)return;
  lastRefresh=Date.now();
  try{
-  const remote=await fetchAll();
+  let remote;
+  cloud.refreshing=true;
+  for(let i=0;i<3;i++){cloud.missed=false;remote=await fetchAll();if(!cloud.missed)break}
+  cloud.refreshing=false;
   const serverEmpty=!Object.keys(remote.plans).length;
   let next;
   if(serverEmpty&&!cloud.base){
@@ -352,11 +372,13 @@ async function refresh(){
   if(next){S=fromRows(next);normalize()}
   ver++;persist();setStatus(cloud.down?'offline':'live');scheduleRender(true);queueFlush(50);
  }catch(e){
+  cloud.refreshing=false;
   setStatus(navigator.onLine===false?'offline':'error',navigator.onLine===false?'You are offline. Showing what this device has saved.':'Could not load from the database: '+errText(e));
   scheduleRender(true);
  }
 }
 function applyEvents(){
+ if(cloud.refreshing){if(cloud.events.length)cloud.missed=true;cloud.events.length=0;return}
  const evs=cloud.events.splice(0);if(!evs.length||!cloud.base)return;
  const cur=toRows(S);let touched=false;
  for(const e of evs){
@@ -364,7 +386,9 @@ function applyEvents(){
   const row=e.eventType==='DELETE'?e.old:e.new;if(!row||row.user_id!==cloud.uid||!row.id)continue;
   const id=row.id,pending=stable(cur[t][id])!==stable(cloud.base[t][id]);
   if(e.eventType==='DELETE'){delete cloud.base[t][id];if(!pending&&id in cur[t]){delete cur[t][id];touched=true}}
-  else{const r=strip(row);cloud.base[t][id]=r;if(!pending&&stable(cur[t][id])!==stable(r)){cur[t][id]=r;touched=true}}
+  else{const r=strip(row),was=cloud.base[t][id];cloud.base[t][id]=r;
+   const next=!pending?r:(id in cur[t]&&was?merge3(was,cur[t][id],r):cur[t][id]);
+   if(next!==undefined&&stable(cur[t][id])!==stable(next)){cur[t][id]=next;touched=true}}
  }
  if(touched){S=fromRows(cur);normalize();ver++}
  persist();if(touched)scheduleRender(true);
@@ -435,9 +459,15 @@ function langFor(p,ds){
  const hit=L.find(x=>inRange(ds,x));if(hit)return hit.name;
  const prev=L.filter(x=>x.start<=ds).pop();return prev?prev.name:(L[0]?L[0].name:'Language');
 }
+/* Progress counts from S.meta.trackFrom. Earlier days are a preview: shown, never tracked or counted. */
+const firstStart=()=>plans().reduce((a,p)=>p.start&&(!a||p.start<a)?p.start:a,'');
+const trackFrom=()=>S.meta.trackFrom||firstStart();
+const preStart=ds=>{const f=trackFrom();return !!f&&ds<f};
+/* Week 1 is the first full Monday-to-Sunday week; a plan that starts mid-week opens with a warm-up week. */
+const weekOne=p=>addDays(p.start,(8-parse(p.start).getDay())%7);
 function ctx(ds,p){
  p=p||planFor(ds);
- const wk=mondayOf(ds),wi=Math.floor(daysBetween(mondayOf(p.start),wk)/7);
+ const wk=mondayOf(ds),wi=Math.floor(daysBetween(weekOne(p),wk)/7);
  const brk=(p.breaks||[]).find(x=>inRange(ds,x))||null,every=+p.deloadEvery||0;
  return {ds,p,wk,wi,brk,busy:!!S.meta.busy[wk],deload:every>0&&wi>=0&&(wi+1)%every===0&&!brk,pre:ds<p.start,after:ds>p.end,
   phase:phaseAt(p,ds),lang:langFor(p,ds),rot:(p.rotation||[]).find(r=>inRange(ds,r))||null};
@@ -469,7 +499,7 @@ function blocksFor(ds){
  const key=ver+'|'+ds;if(blockMemo.has(key))return blockMemo.get(key);
  if(blockMemo.size>4000)blockMemo.clear();
  const p=planFor(ds);if(!p){blockMemo.set(key,[]);return []}
- const c=ctx(ds,p),wd=parse(ds).getDay(),cut=1-(Math.min(90,Math.max(0,+p.deloadCut||0))/100);
+ const c=ctx(ds,p),wd=parse(ds).getDay(),cut=1-(Math.min(90,Math.max(0,+p.deloadCut||0))/100),pre=preStart(ds);
  const out=[...((p.template||{})[wd]||[])].sort((a,b)=>toMin(a.s)-toMin(b.s)).map(raw=>{
   const b={...raw};const pu=pursuitOf(p,b.cat);
   const usesPhase=/\{phase\}/.test((raw.title||'')+(raw.detail||''));
@@ -478,6 +508,7 @@ function blocksFor(ds){
   b.title=fill(b.title,c);b.detail=fill(b.detail,c);
   b.track=!!pu.tracked&&b.h>0;
   b.xp=b.track?Math.max(5,Math.round(b.h*10)):0;
+  if(pre&&b.track){b.track=false;b.preview=true;b.xp=0}
   if(c.brk&&b.track){b.track=false;b.dropped=c.brk.name+(c.brk.note?': '+c.brk.note:'')}
   else if(usesPhase&&c.phase&&c.phase.brk&&b.track){b.track=false;b.dropped=c.phase.name+': no study.'}
   else if(c.busy&&b.track){
@@ -503,7 +534,7 @@ function weekStats(wk){
 }
 function slipping(){
  const wk=mondayOf(today()),p=planFor(today()),out=[];
- const weeks=[1,2,3].map(i=>addDays(wk,-7*i)).filter(w=>w>=mondayOf(p.start));
+ const fs=trackFrom(),weeks=[1,2,3].map(i=>addDays(wk,-7*i)).filter(w=>w>=weekOne(p)&&(!fs||w>=fs));
  if(weeks.length<3)return out;
  const ws=weeks.map(weekStats);
  for(const pu of p.pursuits)if(pu.tracked&&ws.every(w=>w.per[pu.id]&&w.per[pu.id].p>0&&w.per[pu.id].d/w.per[pu.id].p<.5))out.push(pu);
@@ -534,17 +565,14 @@ function brokeStopRule(g,n){for(let i=n-1;i<g.length-1;i++){let all=true;for(let
 let gameMemo={v:-1,d:'',g:null};
 function game(){
  const t=today();if(gameMemo.v===ver&&gameMemo.d===t)return gameMemo.g;
- const ps=plans();let start=t;
- ps.forEach(p=>{if(p.start&&p.start<start)start=p.start});
- for(const k in S.months)for(const d in S.months[k])if(d<start)start=d;
- S.train.items.forEach(x=>{if(x.ds<start)start=x.ds});
+ const ps=plans(),fs=trackFrom()||t,fw=mondayOf(fs);let start=fs;
  if(daysBetween(start,t)>3650)start=addDays(t,-3650);
  const g={xp:0,todayXP:0,weekXP:0,blocks:0,perfectDays:0,perfectWeeks:0,solidWeeks:0,streak:0,best:0,pxp:{},phours:{},pcur:{},pbest:{},
   train:0,trainMin:0,cards:0,discipline:0,wins:0,games:0,rested:0,sleepLogs:0,books:0,loops:0,reviews:0,reviewRun:0,reviewBest:0,meals:0,builds:0,ms:0,phases:0,weekTargets:0};
  const wkNow=mondayOf(t);
  const add=(n,ds)=>{g.xp+=n;if(ds===t)g.todayXP+=n;if(ds>=wkNow&&ds<=t)g.weekXP+=n};
  let wk=null,wkP=0,wkD=0;
- const closeWeek=(w,P,D)=>{if(!w||P<=0)return;const r=D/P,cd=addDays(w,6)<t?addDays(w,6):t;
+ const closeWeek=(w,P,D)=>{if(!w||P<=0||w<fs)return;const r=D/P,cd=addDays(w,6)<t?addDays(w,6):t;
   if(r>=.999){g.perfectWeeks++;g.solidWeeks++;add(XP.perfectWeek,cd)}else if(r>=.8){g.solidWeeks++;add(XP.solidWeek,cd)}};
  for(let ds=start;ds<=t;ds=addDays(ds,1)){
   const w=mondayOf(ds);if(w!==wk){closeWeek(wk,wkP,wkD);wk=w;wkP=0;wkD=0}
@@ -570,16 +598,16 @@ function game(){
  }
  if(wk===wkNow){const ws=weekStats(wkNow);closeWeek(wkNow,ws.ph,ws.dh)}else closeWeek(wk,wkP,wkD);
  const minsByWeek={};
- for(const x of S.train.items){if(x.ds>t)continue;g.train++;g.trainMin+=+x.min||0;add(XP.training,x.ds);const w=mondayOf(x.ds);minsByWeek[w]=(minsByWeek[w]||0)+(+x.min||0)}
+ for(const x of S.train.items){if(x.ds>t||x.ds<fs)continue;g.train++;g.trainMin+=+x.min||0;add(XP.training,x.ds);const w=mondayOf(x.ds);minsByWeek[w]=(minsByWeek[w]||0)+(+x.min||0)}
  for(const w in minsByWeek){const target=+((planFor(w).modules||{}).training||{}).target||0;if(target&&minsByWeek[w]>=target){g.weekTargets++;add(XP.weekTarget,w)}}
  const m=S.meta;
- const revWeeks=Object.keys(m.reviews).filter(w=>{const r=m.reviews[w];return r&&(r.done||r.slipped||r.change)}).sort();
+ const revWeeks=Object.keys(m.reviews).filter(w=>{const r=m.reviews[w];return w>=fw&&r&&(r.done||r.slipped||r.change)}).sort();
  let prev=null;for(const w of revWeeks){g.reviews++;add(XP.review,w);g.reviewRun=(prev&&addDays(prev,7)===w)?g.reviewRun+1:1;g.reviewBest=Math.max(g.reviewBest,g.reviewRun);prev=w}
  if(prev&&prev<addDays(wkNow,-7))g.reviewRun=0;
- for(const w in m.loops)if(m.loops[w]){g.loops++;add(XP.loop,w)}
- for(const w in m.food){const tgt=+((planFor(w).modules||{}).food||{}).meals||5;if((+m.food[w].prep||0)>=tgt){g.meals++;add(XP.meals,w)}}
- for(const w in m.builds)if(m.builds[w]){g.builds++;add(XP.build,w)}
- for(const b of m.books||[])if(b.status==='done'){g.books++;add(XP.book,b.finished||t)}
+ for(const w in m.loops)if(w>=fw&&m.loops[w]){g.loops++;add(XP.loop,w)}
+ for(const w in m.food){if(w<fw)continue;const tgt=+((planFor(w).modules||{}).food||{}).meals||5;if((+m.food[w].prep||0)>=tgt){g.meals++;add(XP.meals,w)}}
+ for(const w in m.builds)if(w>=fw&&m.builds[w]){g.builds++;add(XP.build,w)}
+ for(const b of m.books||[])if(b.status==='done'&&!(b.finished&&b.finished<fs)){g.books++;add(XP.book,b.finished||t)}
  for(const p of ps)for(const ph of p.phases||[]){const items=ph.items||[];if(!items.length)continue;let n=0;
   items.forEach((_,i)=>{if(m.ml[ph.id+':'+i]){n++;g.ms++;add(XP.milestone,ph.start||t)}});
   if(n===items.length){g.phases++;add(XP.phase,ph.end&&ph.end<t?ph.end:t)}}
@@ -612,6 +640,7 @@ const BADGES=[
  {id:'lvl10',name:'Double digits',desc:'Reach level 10.',prog:g=>[g.level,10]},
 ].map(b=>({...b,test:g=>{const [a,n]=b.prog(g);return a>=n}}));
 function dailyQuests(ds){
+ if(preStart(ds))return [];
  const p=planFor(ds),st=dayStats(ds),d=getDay(ds),q=[];
  if(st.total){
   q.push({t:'Keep the streak: 70% of today’s hours',cur:st.dh,max:.7*st.ph,fmt:'h',xp:'streak'});
@@ -625,8 +654,9 @@ function dailyQuests(ds){
  return q;
 }
 function weeklyQuests(wk){
+ const fs=trackFrom();if(fs&&addDays(wk,6)<fs)return [];
  const p=planFor(wk),m=S.meta,ws=weekStats(wk),q=[];
- q.push({t:'Solid week: 80% of planned hours',cur:ws.dh,max:.8*ws.ph,fmt:'h',xp:XP.solidWeek});
+ if(!fs||wk>=fs)q.push({t:'Solid week: 80% of planned hours',cur:ws.dh,max:.8*ws.ph,fmt:'h',xp:XP.solidWeek});
  if(modOn(p,'training')&&+p.modules.training.target)q.push({t:`Train ${p.modules.training.target} minutes`,cur:weekTrainMin(wk),max:+p.modules.training.target,xp:XP.weekTarget});
  if(modOn(p,'milestones'))q.push({t:'Log a weekly build',cur:m.builds[wk]?1:0,max:1,xp:XP.build});
  if(modOn(p,'music'))q.push({t:'Finish a production loop',cur:m.loops[wk]?1:0,max:1,xp:XP.loop});
@@ -651,7 +681,7 @@ function header(){
  const d=new Date(),t=today(),c=ctx(t),g=game();
  const sub=c.pre?`${c.p.name} starts ${fmtShort(c.p.start)} · ${daysBetween(t,c.p.start)} days to go`
   :c.after?`${c.p.name} ended ${fmtShort(c.p.end)}. Start your next plan in the Plan tab.`
-  :[`Week ${c.wi+1}`,c.brk?c.brk.name:phaseLabel(c.p,t).split(' · ')[0],c.deload?'Deload week':'',c.busy?'Busy week':''].filter(Boolean).join(' · ');
+  :[c.wi<0?'Warm-up week':`Week ${c.wi+1}`,c.brk?c.brk.name:phaseLabel(c.p,t).split(' · ')[0],c.deload?'Deload week':'',c.busy?'Busy week':''].filter(Boolean).join(' · ');
  const tabs=[['today','Today'],['week','Week'],['progress','Progress'],['programs','Programs'],['review','Review'],['plan','Plan'],['data','Settings']];
  return `<header class="top"><div class="wrap"><div class="toprow">
   <div class="brand"><h1>Cadence</h1><span class="sub">${esc(fmtDate(t))} · ${esc(sub)}</span></div>
@@ -673,6 +703,9 @@ function nowCard(){
 }
 function banners(c){
  const out=[],p=c.p,dec=(p.training||{}).decision||{};
+ const span=c.span||1,tf=trackFrom(),startBtn=preStart(today())?` <button class="btn ghost small" data-a="trackfrom" data-v="${today()}">Start counting today</button>`:'';
+ if(preStart(addDays(c.ds,span-1)))out.push(['',`<b>Preview.</b> Progress counts from ${fmtDate(tf)}. Days before that aren’t tracked or counted.${startBtn}`]);
+ else if(preStart(c.ds))out.push(['',`<b>Progress counts from ${fmtDate(tf)}.</b> Earlier days this week aren’t tracked or counted.`]);
  if(c.brk)out.push(['good',`<b>${esc(c.brk.name)}.</b> ${esc(c.brk.note||'Full break.')} Runs ${fmtShort(c.brk.start)} – ${fmtShort(c.brk.end)}.`]);
  if(c.deload)out.push(['warn',`<b>Deload week.</b> Cut the marked pursuits by ${+p.deloadCut||0}% and rest. The planned hours already reflect it, so you lose no XP.`]);
  if(c.busy)out.push(['warn','<b>Busy week: minimums only.</b> Dropped blocks are off and minimum blocks shrink. Doing the minimums still counts as a full day.']);
@@ -690,7 +723,7 @@ function blockExtra(b,ds,p){
   return `<div class="extra"><div class="row" style="align-items:flex-end">
    <label class="field" style="flex:0 1 130px"><span>Went to bed</span><input type="time" id="bed-${ds}" data-c="sleep" data-k="bed" data-d="${ds}" value="${esc(s.bed||'')}"></label>
    <label class="field" style="flex:0 1 130px"><span>Woke up</span><input type="time" id="wake-${ds}" data-c="sleep" data-k="wake" data-d="${ds}" value="${esc(s.wake||'')}"></label>
-   ${h!=null?`<span class="pill ${h>=7&&h<=9.5?'good':'warn'}" style="margin-bottom:8px">${fmtH(h)} slept</span>`:`<span class="small muted" style="margin-bottom:8px">+${XP.sleepLog} XP to log, +${XP.rested} more for 7–9.5 h</span>`}</div></div>`;
+   ${h!=null?`<span class="pill ${h>=7&&h<=9.5?'good':'warn'}" style="margin-bottom:8px">${fmtH(h)} slept</span>`:`<span class="small muted" style="margin-bottom:8px">${preStart(ds)?'Before progress starts counting':`+${XP.sleepLog} XP to log, +${XP.rested} more for 7–9.5 h`}</span>`}</div></div>`;
  }
  if(!b.track)return '';
  if(b.extra==='games'){
@@ -713,11 +746,11 @@ function blockExtra(b,ds,p){
  }
  if(b.extra==='build'){
   const wk=mondayOf(ds);
-  return `<div class="extra"><label class="field"><span>What did you build this week? (+${XP.build} XP)</span><input type="text" id="build-${wk}" data-c="build" data-wk="${wk}" value="${esc(S.meta.builds[wk]||'')}" placeholder="e.g. micrograd engine training a 2-layer MLP"></label></div>`;
+  return `<div class="extra"><label class="field"><span>What did you build this week?${preStart(addDays(wk,6))?'':` (+${XP.build} XP)`}</span><input type="text" id="build-${wk}" data-c="build" data-wk="${wk}" value="${esc(S.meta.builds[wk]||'')}" placeholder="e.g. micrograd engine training a 2-layer MLP"></label></div>`;
  }
  if(b.extra==='meals'){
   const wk=parse(ds).getDay()===0?addDays(ds,1):mondayOf(ds),f=S.meta.food[wk]||{},target=+((p.modules.food||{}).meals)||5;
-  return `<div class="extra"><div class="row"><span class="small muted">Meals prepped for the week of ${fmtShort(wk)}</span><button class="iconbtn" data-a="prep" data-wk="${wk}" data-v="-1" aria-label="Fewer meals">−</button><span class="num">${f.prep||0}/${target}</span><button class="iconbtn" data-a="prep" data-wk="${wk}" data-v="1" aria-label="More meals">+</button><span class="xptag">+${XP.meals} XP at ${target}</span></div></div>`;
+  return `<div class="extra"><div class="row"><span class="small muted">Meals prepped for the week of ${fmtShort(wk)}</span><button class="iconbtn" data-a="prep" data-wk="${wk}" data-v="-1" aria-label="Fewer meals">−</button><span class="num">${f.prep||0}/${target}</span><button class="iconbtn" data-a="prep" data-wk="${wk}" data-v="1" aria-label="More meals">+</button>${preStart(addDays(wk,6))?'':`<span class="xptag">+${XP.meals} XP at ${target}</span>`}</div></div>`;
  }
  return '';
 }
@@ -764,7 +797,7 @@ function viewToday(){
    <div class="tl">${tl}</div></section>${side}</div>`;
 }
 const weekDays=wk=>[...Array(7)].map((_,i)=>addDays(wk,i));
-const weekTrainMin=wk=>S.train.items.filter(x=>mondayOf(x.ds)===wk).reduce((a,x)=>a+(+x.min||0),0);
+const weekTrainMin=wk=>S.train.items.filter(x=>mondayOf(x.ds)===wk&&!preStart(x.ds)).reduce((a,x)=>a+(+x.min||0),0);
 const weekCards=wk=>weekDays(wk).reduce((a,d)=>a+(getDay(d).cards||0),0);
 function weekGames(wk){let w=0,l=0;weekDays(wk).forEach(d=>((getDay(d).valo||{}).g||[]).forEach(x=>{if(x==='W')w++;if(x==='L')l++}));return w+'–'+l}
 function sleepSummary(days){
@@ -785,8 +818,8 @@ function viewWeek(){
  if(modOn(p,'language'))stats.push([weekCards(wk),'new cards']);
  const sl=sleepSummary(weekDays(wk));
  if(sl)stats.push([fmtH(sl.avg),`avg sleep · bed ~${fmtClock(sl.bed)}`]);
- return `${banners(c)}<section class="panel">
-  <div class="daynav"><button class="iconbtn" data-a="day" data-v="-7" aria-label="Previous week">‹</button><h2>Week of ${fmtShort(wk)}${c.wi>=0&&!c.after?` · week ${c.wi+1}`:''}</h2><button class="iconbtn" data-a="day" data-v="7" aria-label="Next week">›</button></div>
+ return `${banners({...c,span:7})}<section class="panel">
+  <div class="daynav"><button class="iconbtn" data-a="day" data-v="-7" aria-label="Previous week">‹</button><h2>Week of ${fmtShort(wk)}${c.after?'':c.wi>=0?` · week ${c.wi+1}`:addDays(wk,6)>=c.p.start?' · warm-up week':''}</h2><button class="iconbtn" data-a="day" data-v="7" aria-label="Next week">›</button></div>
   <div class="week">${days}</div>
   <label class="ck" style="padding:0"><input type="checkbox" id="busy-${wk}" data-c="busy" data-wk="${wk}" ${c.busy?'checked':''}> Busy week (deadline, travel, exams): drop to minimums</label>
  </section>
@@ -901,7 +934,7 @@ function progMusic(p,m){
   ${seg(st.theory,'theory','Theory stage')}${seg(st.ear,'ear','Ear training stage')}
   <div class="stats"><div class="stat"><span class="big">${g.pcur[m.cat]||0}</span><span class="small muted">day streak · best ${g.pbest[m.cat]||0}</span></div></div></section>
  <section class="panel" ${laneOf(p,m.prodCat||m.cat)}><h2>Production</h2><p class="small muted">Finish one 60–90 second loop or sketch a week, done rather than perfect.</p>
-  <label class="ck"><input type="checkbox" id="loop-${wk}" data-c="loop" data-wk="${wk}" ${S.meta.loops[wk]?'checked':''}><span>This week’s loop is finished <span class="xptag">+${XP.loop} XP</span></span></label>
+  <label class="ck"><input type="checkbox" id="loop-${wk}" data-c="loop" data-wk="${wk}" ${S.meta.loops[wk]?'checked':''}><span>This week’s loop is finished ${preStart(addDays(wk,6))?'':`<span class="xptag">+${XP.loop} XP</span>`}</span></label>
   <div class="stats"><div class="stat"><span class="big">${loops}</span><span class="small muted">loops finished in this plan</span></div></div></section></div>`;
 }
 function progLang(p,m){
@@ -925,7 +958,7 @@ function progGames(p,m){
 function progRead(p,m){
  const books=S.meta.books||[];const reading=books.filter(b=>b.status==='reading'),queued=books.filter(b=>b.status==='queued'),done=books.filter(b=>b.status==='done');
  const item=b=>`<div class="li"><div class="grow"><div>${esc(b.title)}${b.finished?` <span class="small muted">· ${fmtLong(b.finished)}</span>`:''}</div>${b.status==='done'?`<input type="text" id="line-${b.id}" data-c="bookline" data-id="${b.id}" value="${esc(b.line||'')}" placeholder="One line on this book" style="margin-top:4px">`:''}</div>
-  ${b.status==='queued'?`<button class="btn small" data-a="book" data-id="${b.id}" data-v="reading">Start</button>`:''}${b.status==='reading'?`<button class="btn small" data-a="book" data-id="${b.id}" data-v="done">Finished · +${XP.book} XP</button>`:''}<button class="btn ghost danger small" data-a="delbook" data-id="${b.id}">Remove</button></div>`;
+  ${b.status==='queued'?`<button class="btn small" data-a="book" data-id="${b.id}" data-v="reading">Start</button>`:''}${b.status==='reading'?`<button class="btn small" data-a="book" data-id="${b.id}" data-v="done">Finished${preStart(today())?'':` · +${XP.book} XP`}</button>`:''}<button class="btn ghost danger small" data-a="delbook" data-id="${b.id}">Remove</button></div>`;
  return `<div class="grid2"><section class="panel" ${laneOf(p,m.cat)}><h2>${esc(m.title)}</h2>${m.blurb?`<p class="small muted">${esc(m.blurb)}</p>`:''}
   <form class="row" data-form="book" style="flex-wrap:nowrap"><input type="text" id="newbook" name="title" placeholder="Add a book to the list" required><button class="btn primary" type="submit">Add</button></form>
   <h3>Reading now</h3><div class="list">${reading.map(item).join('')||'<p class="empty">Nothing on the go. Start one from the list.</p>'}</div>
@@ -936,7 +969,7 @@ function progRead(p,m){
 function progFood(p,m){
  const wk=mondayOf(today()),f=S.meta.food[wk]||{};
  return `<section class="panel" ${laneOf(p,m.cat)}><h2>${esc(m.title)}</h2>${m.blurb?`<p class="small muted">${esc(m.blurb)}</p>`:''}
-  <div class="row"><span>Meals prepped this week</span><button class="iconbtn" data-a="prep" data-wk="${wk}" data-v="-1" aria-label="Fewer meals">−</button><span class="num">${f.prep||0}/${+m.meals||5}</span><button class="iconbtn" data-a="prep" data-wk="${wk}" data-v="1" aria-label="More meals">+</button><span class="xptag">+${XP.meals} XP at target</span></div>
+  <div class="row"><span>Meals prepped this week</span><button class="iconbtn" data-a="prep" data-wk="${wk}" data-v="-1" aria-label="Fewer meals">−</button><span class="num">${f.prep||0}/${+m.meals||5}</span><button class="iconbtn" data-a="prep" data-wk="${wk}" data-v="1" aria-label="More meals">+</button>${preStart(addDays(wk,6))?'':`<span class="xptag">+${XP.meals} XP at target</span>`}</div>
   <label class="field"><span>This week’s new recipe</span><input type="text" id="recipe-${wk}" data-c="recipe" data-wk="${wk}" value="${esc(f.recipe||'')}" placeholder="e.g. chana masala with paneer tikka"></label>
   <details><summary>Past recipes</summary><div class="list">${Object.entries(S.meta.food).filter(([,v])=>v.recipe).sort((a,b)=>b[0].localeCompare(a[0])).map(([w,v])=>`<div class="li"><span class="num small muted" style="width:52px">${fmtShort(w)}</span><span class="grow">${esc(v.recipe)}</span></div>`).join('')||'<p class="empty">None yet.</p>'}</div></details></section>`;
 }
@@ -950,7 +983,7 @@ function viewReview(){
  const t=today(),wk=mondayOf(t),p=planFor(t),r=S.meta.reviews[wk]||{},slip=slipping(),ws=weekStats(wk);
  const past=Object.entries(S.meta.reviews).filter(([w])=>w!==wk).sort((a,b)=>b[0].localeCompare(a[0]));
  const q=(k,l)=>`<label class="field"><span>${l}</span><textarea id="rv-${k}-${wk}" data-c="review" data-wk="${wk}" data-k="${k}">${esc(r[k]||'')}</textarea></label>`;
- return `<div class="grid2"><section class="panel"><div class="row"><h2>Weekly review · ${fmtShort(wk)}</h2><span class="spacer"></span><span class="xptag">+${XP.review} XP</span></div>
+ return `<div class="grid2"><section class="panel"><div class="row"><h2>Weekly review · ${fmtShort(wk)}</h2><span class="spacer"></span>${preStart(addDays(wk,6))?'':`<span class="xptag">+${XP.review} XP</span>`}</div>
   <p class="small muted">This week so far: ${fmtH(ws.dh)} of ${fmtH(ws.ph)} planned.</p>
   ${q('done','What got done?')}${q('slipped','What slipped, and why?')}${q('change','What changes next week?')}</section>
   <div class="stack"><section class="panel"><div class="row"><h3>Rules for a bad week</h3><span class="spacer"></span><button class="btn ghost small" data-a="busynow">${S.meta.busy[wk]?'Turn off busy week':'Mark this week busy'}</button></div>
@@ -999,7 +1032,7 @@ function edBasics(p){
  return `<div class="ed"><div class="edrow">
   ${F(p,'name',{label:'Plan name',cls:'wide'})}${F(p,'start',{label:'Starts',type:'date',cls:'narrow'})}${F(p,'end',{label:'Ends',type:'date',cls:'narrow'})}</div>
   <div class="edrow">${F(p,'deloadEvery',{label:'Deload every N weeks (0 = off)',type:'number',dt:'num',cls:'narrow'})}${F(p,'deloadCut',{label:'Deload cut, %',type:'number',dt:'num',cls:'narrow'})}
-  <p class="help" style="flex:1 1 200px">Deload weeks cut the hours of pursuits marked “Deload” in Pursuits. Week 1 is the week the plan starts.</p></div></div>`;
+  <p class="help" style="flex:1 1 200px">Deload weeks cut the hours of pursuits marked “Deload” in Pursuits. Week 1 is the first full Monday–Sunday week of the plan; a plan that starts mid-week opens with a warm-up week.</p></div></div>`;
 }
 function edPursuits(p){
  const used=id=>Object.values(p.template||{}).reduce((a,d)=>a+(d||[]).filter(b=>b.cat===id).length,0);
@@ -1084,6 +1117,8 @@ function viewData(){
   :`<p>You’re using Cadence without an account, so data stays in this browser only.</p><div class="row">${chipHTML()}<span class="spacer"></span>${sb?'<button class="btn primary" data-a="gosignin">Sign in to sync</button>':''}</div><p class="small muted">When you sign in to an empty account, everything on this device comes with you.</p>`}
   ${cloud.err&&cloudOn?`<div class="banner bad"><span class="bar"></span><div>${esc(cloud.err)}</div></div>`:''}
   <h3>Install</h3><p class="small muted">On iPhone: Share → Add to Home Screen. On Android or desktop Chrome/Edge: the install icon in the address bar, or menu → Install app.</p>
+  <h3>Progress</h3><p class="small muted">XP, streaks, quests and stats count from this date. Earlier days stay saved but show as a preview.</p>
+  <div class="row"><label class="field" style="flex:0 1 180px"><span>Count progress from</span><input type="date" id="trackfrom" data-c="trackfrom" value="${esc(S.meta.trackFrom||'')}"></label><button class="btn" data-a="trackfrom" data-v="${today()}" style="align-self:flex-end">Start from today</button></div>
   <h3>Theme</h3><div class="seg" role="group" aria-label="Theme">${['system','light','dark'].map(t=>`<button data-a="theme" data-v="${t}" aria-pressed="${(S.meta.theme||'system')===t}">${t[0].toUpperCase()+t.slice(1)}</button>`).join('')}</div></section>
   <section class="panel"><h2>Backup</h2>
    <p class="small muted">Download everything (plans, ticks, logs, notes) as a JSON file, or paste a backup to restore it. Backups from the earlier version of Cadence work too.</p>
@@ -1204,6 +1239,7 @@ app.addEventListener('click',async e=>{
   case 'delbook':mutMeta(m=>{m.books=m.books.filter(x=>x.id!==el.dataset.id)});break;
   case 'busynow':mutMeta(m=>{const w=mondayOf(today());if(m.busy[w])delete m.busy[w];else m.busy[w]=1});break;
   case 'theme':mutMeta(m=>{m.theme=v});break;
+  case 'trackfrom':mutMeta(m=>{m.trackFrom=v});toast(`<span>Progress now counts from ${esc(fmtDate(v))}</span>`);break;
   case 'confirm':ui.confirm=v;render();break;
   case 'unconfirm':ui.confirm=null;render();break;
   case 'editplan':ui.editPlan=v;ui.confirm=null;ui.note='';render();break;
@@ -1247,6 +1283,7 @@ app.addEventListener('change',e=>{
   case 'aim':mutDay(el.dataset.d,x=>{x.valo=x.valo||{};x.valo.aim=val});break;
   case 'sleep':mutDay(el.dataset.d,x=>{x.sleep=x.sleep||{};x.sleep[el.dataset.k]=val;if(!x.sleep.bed&&!x.sleep.wake)delete x.sleep});break;
   case 'busy':mutMeta(m=>{if(val)m.busy[el.dataset.wk]=1;else delete m.busy[el.dataset.wk]});break;
+  case 'trackfrom':if(/^\d{4}-\d{2}-\d{2}$/.test(val))mutMeta(m=>{m.trackFrom=val});else render();break;
   case 'ml':mutMeta(m=>{if(val)m.ml[el.dataset.k]=1;else delete m.ml[el.dataset.k]});break;
   case 'loop':mutMeta(m=>{if(val)m.loops[el.dataset.wk]=1;else delete m.loops[el.dataset.wk]});break;
   case 'build':mutMeta(m=>{const t=val.trim();if(t)m.builds[el.dataset.wk]=t;else delete m.builds[el.dataset.wk]});break;
@@ -1296,10 +1333,14 @@ document.addEventListener('visibilitychange',()=>{if(!document.hidden&&S)schedul
    them here through the same mutations as the buttons, so every change
    syncs, earns XP and can be undone.
    ===================================================================== */
-const chat={open:false,busy:false,api:[],items:[],snaps:new Map(),undone:false,rec:null,voice:false,loadedFor:null};
+const chat={open:false,busy:false,api:[],items:[],undos:{},undone:false,rec:null,voice:false,loadedFor:null};
 const chatKey=()=>'cadence.chat.'+(cloud.uid||'local');
-function loadChat(){const c=LS.get(chatKey());chat.api=c&&Array.isArray(c.api)?c.api:[];chat.items=c&&Array.isArray(c.items)?c.items:[];chat.loadedFor=chatKey()}
-function saveChat(){LS.set(chatKey(),{api:chat.api.slice(-200),items:chat.items.slice(-80).map(i=>({...i,canUndo:false}))})}
+function loadChat(){const c=LS.get(chatKey());chat.api=c&&Array.isArray(c.api)?c.api:[];chat.items=c&&Array.isArray(c.items)?c.items:[];chat.undos=c&&c.undos&&typeof c.undos==='object'?c.undos:{};chat.loadedFor=chatKey()}
+function saveChat(){const items=chat.items.slice(-80),keep=new Set(items.map(i=>i.id).slice(-30)),undos={};for(const k in chat.undos)if(keep.has(k))undos[k]=chat.undos[k];chat.undos=undos;LS.set(chatKey(),{api:chat.api.slice(-200),items,undos})}
+/* Undo records the rows a reply changed (before and after), so it can reverse exactly those rows later. */
+function rowDiff(before,after){const a=toRows(before),b=toRows(after),out=[];
+ for(const t of TABLES)for(const id of new Set([...Object.keys(a[t]),...Object.keys(b[t])]))if(stable(a[t][id])!==stable(b[t][id]))out.push({t,id,before:a[t][id]??null,after:b[t][id]??null});
+ return out}
 const isDate=s=>/^\d{4}-\d{2}-\d{2}$/.test(s||'')&&iso(parse(s))===s;
 const isTime=s=>/^([01]\d|2[0-3]):[0-5]\d$/.test(s||'');
 const needDate=d=>{if(!isDate(d))throw 'date must be a real date written YYYY-MM-DD';return d};
@@ -1307,7 +1348,7 @@ const titleOf=(ds,id)=>{const b=blocksFor(ds).find(x=>x.id===id);return b?b.titl
 function dayView(ds){
  const p=planFor(ds),d=getDay(ds),st=dayStats(ds);
  return {date:ds,weekday:DOW[parse(ds).getDay()],plan_id:p.id,
-  blocks:blocksFor(ds).map(b=>({id:b.id,start:b.s,end:fmtEnd(b.e),title:b.title,pursuit:pursuitOf(p,b.cat).name,tracked:b.track,...(b.dropped?{dropped:b.dropped}:{}),done:!!st.done[b.id],hours:Math.round(b.h*100)/100,...(b.extra?{widget:b.extra}:{})})),
+  blocks:blocksFor(ds).map(b=>({id:b.id,start:b.s,end:fmtEnd(b.e),title:b.title,pursuit:pursuitOf(p,b.cat).name,tracked:b.track,...(b.preview?{preview:true}:{}),...(b.dropped?{dropped:b.dropped}:{}),done:!!st.done[b.id],hours:Math.round(b.h*100)/100,...(b.extra?{widget:b.extra}:{})})),
   cards:d.cards||0,warmup:!!(d.valo||{}).aim,games:((d.valo||{}).g||[]).join(''),sleep:d.sleep||null,
   training:S.train.items.filter(x=>x.ds===ds).map(x=>({id:x.id,type:x.type,minutes:x.min,km:x.km||null,rpe:x.rpe||null,note:x.note||''}))};
 }
@@ -1345,6 +1386,7 @@ const TOOL_IMPL={
   const ds=needDate(i.date),blocks=blocksFor(ds),byId=new Map(blocks.map(b=>[b.id,b]));
   const unknown=[...(i.done||[]),...(i.undone||[])].filter(x=>!byId.has(x));
   if(unknown.length)throw `Unknown block ids on ${ds}: ${unknown.join(', ')}. Call get_day to see that day's blocks.`;
+  if((i.done||[]).length&&preStart(ds))throw `${ds} is before progress starts counting (${trackFrom()}), so nothing can be ticked that day. To count it, move the start with set_tracking_start.`;
   const untracked=(i.done||[]).filter(x=>!byId.get(x).track);
   if(untracked.length)throw `These blocks can't be ticked on ${ds} (untracked or dropped): ${untracked.map(x=>byId.get(x).title).join(', ')}.`;
   for(const k of ['sleep_bed','sleep_wake'])if(i[k]!=null&&i[k]!==''&&!isTime(i[k]))throw `${k} must be HH:MM in 24-hour time.`;
@@ -1460,6 +1502,20 @@ const TOOL_IMPL={
   mutPlans(ps=>{ps.plans.push(np)});
   return {result:{plan_id:np.id,overlaps:overlap},summary:`Created plan “${np.name}”, ${fmtShort(start)} – ${fmtShort(end)}`};
  },
+ set_tracking_start(i){
+  const ds=needDate(i.date),was=trackFrom();
+  mutMeta(m=>{m.trackFrom=ds});
+  return {result:{counting_from:ds,previously:was},summary:`Progress now counts from ${fmtDate(ds)}`};
+ },
+ clear_logs(i){
+  const from=needDate(i.from),to=needDate(i.to);if(to<from)throw 'to must be on or after from.';if(daysBetween(from,to)>400)throw 'Clear at most 400 days at once.';
+  let days=0,sessions=0;
+  for(const k of Object.keys(S.months)){const m=S.months[k];if(!Object.keys(m).some(ds=>ds>=from&&ds<=to))continue;
+   const next=clone(m);for(const ds of Object.keys(next))if(ds>=from&&ds<=to){delete next[ds];days++}S.months[k]=next}
+  const keep=S.train.items.filter(x=>x.ds<from||x.ds>to);sessions=S.train.items.length-keep.length;S.train={items:keep};
+  changed();
+  return {result:{days_cleared:days,training_sessions_deleted:sessions},summary:(days||sessions)?`Cleared logs from ${fmtShort(from)} to ${fmtShort(to)}`:null};
+ },
  get_history(i){
   const from=needDate(i.from),to=needDate(i.to);if(to<from)throw 'to must be on or after from.';if(daysBetween(from,to)>62)throw 'Ask for at most 62 days.';
   const days=[];for(let ds=from;ds<=to;ds=addDays(ds,1)){const st=dayStats(ds),d=getDay(ds),sl=sleepHours(d);
@@ -1487,11 +1543,11 @@ function runTool(name,input){
 function contextText(){
  const t=today(),now=new Date(),p=planFor(t),c=ctx(t,p),g=game(),st=dayStats(t),ws=weekStats(mondayOf(t)),d=getDay(t),ys=dayStats(addDays(t,-1));
  const dec=(p.training||{}).decision||{};
- const blocks=blocksFor(t).map(b=>`${b.id} · ${b.s}–${fmtEnd(b.e)} · ${b.title} · ${b.track?`${st.done[b.id]?'done':'not done'} (${fmtH(b.h)})`:(b.dropped?'dropped':'untracked')}`).join('\n');
+ const blocks=blocksFor(t).map(b=>`${b.id} · ${b.s}–${fmtEnd(b.e)} · ${b.title} · ${b.track?`${st.done[b.id]?'done':'not done'} (${fmtH(b.h)})`:b.preview?'preview (not counted)':(b.dropped?'dropped':'untracked')}`).join('\n');
  let tz='';try{tz=Intl.DateTimeFormat().resolvedOptions().timeZone}catch(e){}
  return ['Live app state.',
   `Now: ${DOW[now.getDay()]} ${t} ${pad(now.getHours())}:${pad(now.getMinutes())}${tz?' ('+tz+')':''}.`,
-  `Plan covering today: "${p.name}" (id ${p.id}), ${p.start} to ${p.end}${c.pre?', not started yet':c.after?', ended':`, week ${c.wi+1}`}. Phase: ${phaseLabel(p,t)||'none'}. Language: ${c.lang}. Rotating block: ${c.rot?c.rot.name:'none'}. Busy week: ${c.busy?'yes':'no'}. Deload week: ${c.deload?'yes':'no'}.${c.brk?` On break: ${c.brk.name}.`:''}`,
+  `Plan covering today: "${p.name}" (id ${p.id}), ${p.start} to ${p.end}${c.pre?', not started yet':c.after?', ended':c.wi<0?`, warm-up week (week 1 starts ${weekOne(p)})`:`, week ${c.wi+1}`}. Progress (XP, streaks, quests, stats) counts from ${trackFrom()}; earlier days are a preview and can't be ticked. Week 1 is the first full Monday-Sunday week of the plan; a mid-week start opens with a warm-up week, and deload weeks count from week 1. Phase: ${phaseLabel(p,t)||'none'}. Language: ${c.lang}. Rotating block: ${c.rot?c.rot.name:'none'}. Busy week: ${c.busy?'yes':'no'}. Deload week: ${c.deload?'yes':'no'}.${c.brk?` On break: ${c.brk.name}.`:''}`,
   dec.question?`Decision "${dec.question}", due ${dec.date}: ${dec.answer||'undecided'}.`:'',
   `Today's blocks (id · time · title · status):\n${blocks||'none'}`,
   `Today's logs: cards ${d.cards||0}; warm-up ${(d.valo||{}).aim?'done':'no'}; games ${((d.valo||{}).g||[]).join('')||'none'}; sleep ${d.sleep&&(d.sleep.bed||d.sleep.wake)?`bed ${d.sleep.bed||'?'}, woke ${d.sleep.wake||'?'}`:'not logged'}; training ${S.train.items.filter(x=>x.ds===t).map(x=>`${x.type} ${x.min} min (id ${x.id})`).join(', ')||'none'}.`,
@@ -1513,7 +1569,7 @@ async function ask(text){
  text=String(text||'').trim();if(!text||chat.busy)return;
  if(mode!=='cloud'||!sb){chat.items.push({id:uid(),role:'error',text:'Sign in to use the assistant. It runs on your account so it can change your data.'});renderChat();return}
  chat.busy=true;
- const snap=clone(S),itemId=uid(),start=chat.api.length;
+ const before=clone(S),itemId=uid(),start=chat.api.length;
  chat.items.push({id:uid(),role:'user',text});
  const reply={id:itemId,role:'assistant',text:'',actions:[]};chat.items.push(reply);
  chat.api.push({role:'user',content:text},{role:'system',content:contextText()});chat.undone=false;
@@ -1539,16 +1595,20 @@ async function ask(text){
   if(chat.api.length&&chat.api[chat.api.length-1].role==='system'){chat.api.length=start}
   reply.role='error';reply.text=e.message||String(e);
  }
- if(reply.actions.length){chat.snaps.set(itemId,snap);reply.canUndo=true}
+ const diff=rowDiff(before,S);if(diff.length){chat.undos[itemId]=diff;reply.canUndo=true}
  chat.busy=false;saveChat();renderChat();
 }
 function undoReply(id){
- const snap=chat.snaps.get(id);if(!snap)return;
- S=clone(snap);normalize();chat.snaps.delete(id);chat.undone=true;
+ const diff=chat.undos[id];if(!diff)return;
+ const cur=toRows(S);let kept=0;
+ for(const d of diff){if(stable(cur[d.t][d.id]??null)!==stable(d.after)){kept++;continue}
+  if(d.before==null)delete cur[d.t][d.id];else cur[d.t][d.id]=d.before}
+ S=fromRows(cur);normalize();delete chat.undos[id];chat.undone=true;
  const it=chat.items.find(x=>x.id===id);if(it){it.canUndo=false;it.undone=true}
- lastGame=null;changed();saveChat();renderChat();toast('<span>Changes undone</span>');
+ lastGame=null;changed();saveChat();renderChat();
+ toast(kept?`<span>Undone, except ${kept} change${kept===1?'':'s'} edited since</span>`:'<span>Changes undone</span>');
 }
-function newChat(){chat.api=[];chat.items=[];chat.snaps.clear();chat.undone=false;saveChat();renderChat()}
+function newChat(){chat.api=[];chat.items=[];chat.undos={};chat.undone=false;saveChat();renderChat()}
 
 /* Chat UI: lives outside #app so app re-renders never touch it. */
 const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
@@ -1567,7 +1627,7 @@ function chatLogHTML(){
   const acts=(it.actions||[]).map(a=>`<span class="act">${esc(a)}</span>`).join('');
   const pending=chat.busy&&it===chat.items[chat.items.length-1];
   return `<div class="msg ai">${acts?`<div class="acts">${acts}</div>`:''}${it.text?`<div>${fmtMsg(it.text)}</div>`:''}${pending?'<div class="typing" aria-label="Working"><i></i><i></i><i></i></div>':''}
-   ${it.canUndo&&chat.snaps.has(it.id)?`<button class="btn ghost small" data-ca="undo" data-v="${it.id}">Undo</button>`:''}${it.undone?'<span class="small muted">Undone</span>':''}</div>`;
+   ${it.canUndo&&chat.undos[it.id]?`<button class="btn ghost small" data-ca="undo" data-v="${it.id}">Undo</button>`:''}${it.undone?'<span class="small muted">Undone</span>':''}</div>`;
  }).join('');
 }
 function renderChat(){

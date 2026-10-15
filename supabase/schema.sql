@@ -178,6 +178,7 @@ create table public.prefs (
   theory_stage integer not null default 0,
   ear_stage integer not null default 0,
   theme text not null default 'system',
+  track_from date, -- progress (XP, streaks, quests, stats) counts from this date; earlier days are a preview
   updated_at timestamptz not null default now(),
   primary key (user_id, id)
 );

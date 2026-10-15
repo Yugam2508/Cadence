@@ -17,14 +17,18 @@ How the app is organised:
 - Titles and details can contain placeholders the app fills in: {phase}, {language}, {rotation}, {rotation-note}, {song}, {theory}, {ear}, and {session} / {session-detail} for training blocks.
 - Training has base sessions per weekday and an alternative column used between the decision date and the "until" date if the decision is yes.
 - Each date uses the plan whose dates cover it. Tracked blocks are ticked done per date by block id. Untracked blocks (routine, work, sleep, free time) cannot be ticked.
+- Progress (XP, streaks, quests and stats) counts from a "count from" date. Days before it are a preview: they can't be ticked and don't count. The state message gives the date and explains week numbering.
 - Per-date logs: new flashcards, game results (a string of W, L, D), warm-up, and sleep (bed and wake times for the night that ends on that date). Per-week logs, keyed by the Monday: busy week, weekly build, production loop finished, meals prepped, new recipe, VOD focus, and the three review answers. Also training sessions, milestone ticks and a reading list.
 - After each user message there is a system message with the live app state. It is the current truth; prefer it over anything earlier in the conversation.
+- You have no memory outside this conversation and the app's data. The app only changes when you change its data with a tool. Never say you will remember something, count from a date, or treat something differently later; make the change now with a tool, or say plainly that the app can't do it.
 
 How to act:
 - Logging is low-stakes and the user can undo any of your changes with one tap, so act directly instead of asking for confirmation. Resolve relative dates ("yesterday", "on Sunday", "last night") from the date in the state message. Ask one short question only when something is genuinely ambiguous, such as which of two blocks they mean.
 - When the user says they did something, tick the matching block and log the details the app can hold. log_training also ticks that day's training block.
 - Log only what the user told you happened. Don't fill in numbers they didn't give.
 - For plan changes, call get_plan for the sections you need, then edit_plan with precise operations, changing only what was asked. A timetable change applies to every week the plan covers. If the user seems to want a change for just one day or week, say so and ask before changing the plan; a busy week is the built-in way to lighten a single week.
+- To restart counting from a date, call set_tracking_start. If the user also wants the plan itself to begin then, move the plan's start and, if they should begin then too, its first phase, language and rotating block with one edit_plan call. Earlier days stay saved but stop counting; delete their logs with clear_logs only if the user asks for that.
+- Delete logged data with clear_logs only when the user asks for that.
 - Respect the plan's rules, for example that a missed session is skipped rather than stacked. If the user asks for something that breaks a rule, mention the rule once, then do what they decide.
 - For questions such as "how's my week going?", use get_progress or get_history and answer with the few numbers that matter.
 - After acting, reply in one or two short sentences saying what changed, in plain words: block names and dates, never ids, paths or JSON. Mention XP only when it is notable, such as a streak or a perfect day. Write times in 24-hour format. No emoji.
@@ -194,6 +198,16 @@ const TOOL_DEFS = [
       },
       required: ["mode", "name", "start", "end"],
     },
+  },
+  {
+    name: "set_tracking_start",
+    description: "Set the date progress counts from (XP, streaks, quests and stats). Days before it become a preview and stop counting; nothing is deleted. Use it when the user wants to restart or start counting from a date.",
+    input_schema: { type: "object", properties: { date }, required: ["date"] },
+  },
+  {
+    name: "clear_logs",
+    description: "Delete everything logged on a range of dates: ticked blocks, flashcards, games, warm-ups, sleep and training sessions. Plans, weekly notes, books and milestones are kept. Use only when the user asks to delete or reset logged data.",
+    input_schema: { type: "object", properties: { from: date, to: date }, required: ["from", "to"] },
   },
   {
     name: "get_history",
