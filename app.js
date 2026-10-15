@@ -177,8 +177,7 @@ function normalize(){
   S.plans.plans.push(p);
  }
  delete S.meta.rotation;delete S.meta.decision;delete S.meta.dad;
- // Progress counts from an explicit date; a new account starts counting today (or when its plan starts, if later).
- if(!/^\d{4}-\d{2}-\d{2}$/.test(S.meta.trackFrom||'')){const f=S.plans.plans.reduce((a,p)=>p.start&&(!a||p.start<a)?p.start:a,''),t=today();S.meta.trackFrom=f&&f>t?f:t}
+ if(!/^\d{4}-\d{2}-\d{2}$/.test(S.meta.trackFrom||''))S.meta.trackFrom='';
  for(const p of S.plans.plans){for(let d=0;d<7;d++)if(!Array.isArray((p.template||(p.template={}))[d]))p.template[d]=[];
   ['phases','languages','breaks','rotation','resources','pursuits','rules'].forEach(k=>{if(!Array.isArray(p[k]))p[k]=[]});
   p.training=p.training||{};p.training.decision=p.training.decision||{};p.training.base=p.training.base||{};p.training.alt=p.training.alt||{};
@@ -226,7 +225,7 @@ function toRows(st){
  }
  for(const k in m.ml)if(m.ml[k]){const i=k.lastIndexOf(':');R.milestone_checks[k]={id:k,phase_key:k.slice(0,i),item_index:+k.slice(i+1)}}
  (m.books||[]).forEach((b,i)=>{R.books[b.id]={id:b.id,title:b.title||'Untitled',status:['queued','reading','done'].includes(b.status)?b.status:'queued',finished_on:dateOrNull(b.finished),line:b.line||'',sort:i}});
- R.prefs.me={id:'me',song:m.song||'',theory_stage:+m.theory||0,ear_stage:+m.ear||0,theme:m.theme||'system',track_from:dateOrNull(m.trackFrom)};
+ R.prefs.me={id:'me',song:m.song||'',theory_stage:+m.theory||0,ear_stage:+m.ear||0,theme:m.theme||'system',...(dateOrNull(m.trackFrom)?{track_from:m.trackFrom}:{})};
  return R;
 }
 function fromRows(R){
@@ -259,7 +258,7 @@ function fromRows(R){
  return st;
 }
 const emptyRows=()=>{const R={};TABLES.forEach(t=>R[t]={});return R};
-const strip=r=>{const o={...r};delete o.user_id;delete o.updated_at;return o};
+const strip=r=>{const o={...r};delete o.user_id;delete o.updated_at;if(o.track_from==null)delete o.track_from;return o};
 
 /* =====================================================================
    Persistence: Supabase when signed in, this device otherwise.
@@ -335,7 +334,8 @@ function merge3(base,local,remote){
  const out={};
  for(const k of new Set([...Object.keys(base),...Object.keys(local),...Object.keys(remote)])){
   const b=base[k],l=local[k],r=remote[k];
-  const v=stable(l)===stable(b)?r:stable(r)===stable(b)?l:merge3(b,l,r);
+  // A field missing locally (an older copy that doesn't know it) is not an edit: take the server's.
+  const v=(l===undefined||stable(l)===stable(b))?r:stable(r)===stable(b)?l:merge3(b,l,r);
   if(v!==undefined)out[k]=v;
  }
  return out;
@@ -461,7 +461,16 @@ function langFor(p,ds){
 }
 /* Progress counts from S.meta.trackFrom. Earlier days are a preview: shown, never tracked or counted. */
 const firstStart=()=>plans().reduce((a,p)=>p.start&&(!a||p.start<a)?p.start:a,'');
-const trackFrom=()=>S.meta.trackFrom||firstStart();
+/* Without a date the user chose, count from the earliest plan start or logged day, whichever is first. */
+let tfMemo={v:-1,d:''};
+function trackFrom(){
+ if(S.meta.trackFrom)return S.meta.trackFrom;
+ if(tfMemo.v===ver)return tfMemo.d;
+ let d=firstStart();
+ for(const k in S.months)for(const ds in S.months[k]){const e=S.months[k][ds];if(e&&((e.c&&Object.keys(e.c).length)||e.cards||e.valo||e.sleep)&&(!d||ds<d))d=ds}
+ for(const x of S.train.items)if(!d||x.ds<d)d=x.ds;
+ tfMemo={v:ver,d};return d;
+}
 const preStart=ds=>{const f=trackFrom();return !!f&&ds<f};
 /* Week 1 is the first full Monday-to-Sunday week; a plan that starts mid-week opens with a warm-up week. */
 const weekOne=p=>addDays(p.start,(8-parse(p.start).getDay())%7);
@@ -1118,7 +1127,7 @@ function viewData(){
   ${cloud.err&&cloudOn?`<div class="banner bad"><span class="bar"></span><div>${esc(cloud.err)}</div></div>`:''}
   <h3>Install</h3><p class="small muted">On iPhone: Share → Add to Home Screen. On Android or desktop Chrome/Edge: the install icon in the address bar, or menu → Install app.</p>
   <h3>Progress</h3><p class="small muted">XP, streaks, quests and stats count from this date. Earlier days stay saved but show as a preview.</p>
-  <div class="row"><label class="field" style="flex:0 1 180px"><span>Count progress from</span><input type="date" id="trackfrom" data-c="trackfrom" value="${esc(S.meta.trackFrom||'')}"></label><button class="btn" data-a="trackfrom" data-v="${today()}" style="align-self:flex-end">Start from today</button></div>
+  <div class="row"><label class="field" style="flex:0 1 180px"><span>Count progress from</span><input type="date" id="trackfrom" data-c="trackfrom" value="${esc(trackFrom())}"></label><button class="btn" data-a="trackfrom" data-v="${today()}" style="align-self:flex-end">Start from today</button></div>
   <h3>Theme</h3><div class="seg" role="group" aria-label="Theme">${['system','light','dark'].map(t=>`<button data-a="theme" data-v="${t}" aria-pressed="${(S.meta.theme||'system')===t}">${t[0].toUpperCase()+t.slice(1)}</button>`).join('')}</div></section>
   <section class="panel"><h2>Backup</h2>
    <p class="small muted">Download everything (plans, ticks, logs, notes) as a JSON file, or paste a backup to restore it. Backups from the earlier version of Cadence work too.</p>
@@ -1260,7 +1269,7 @@ app.addEventListener('click',async e=>{
    const fallback=()=>{ui.importText=txt;render();toast('<span>Copy blocked. The backup is in the box below.</span>')};
    try{navigator.clipboard.writeText(txt).then(()=>toast('<span>Backup copied</span>'),fallback)}catch(_){fallback()}break}
   case 'doimport':{try{const v2=JSON.parse(ui.importText);if(!v2||typeof v2!=='object'||!v2.meta)throw 0;
-   S={meta:v2.meta,train:v2.train||{items:[]},months:v2.months||{},plans:v2.plans||null};normalize();ui.confirm=null;ui.importText='';
+   const keepTf=S&&S.meta&&S.meta.trackFrom;S={meta:v2.meta,train:v2.train||{items:[]},months:v2.months||{},plans:v2.plans||null};if(!S.meta.trackFrom&&keepTf)S.meta.trackFrom=keepTf;normalize();ui.confirm=null;ui.importText='';
    lastGame=null;changed();toast('<span>Backup restored</span>')}catch(_){ui.confirm=null;render();toast('<span>That backup could not be read.</span>')}break}
   case 'signout':if(sb){LS.del(cacheKey());if(cloud.channel)try{sb.removeChannel(cloud.channel)}catch(_){}
    await sb.auth.signOut();mode='auth';cloud.uid=null;cloud.base=null;S=null;lastGame=null;ui.auth={mode:'signin',email:cloud.email,msg:'Signed out.',bad:false,busy:false};render()}break;
